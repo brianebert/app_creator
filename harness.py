@@ -229,7 +229,7 @@ INDEX_PAGE = """<!doctype html>
   </div>
   <textarea id="input" rows="3" placeholder="Describe what you want..."></textarea>
   <button id="send-btn">Send</button>
-  <button id="publish-btn">Publish</button>
+  <button id="publish-btn">Import</button>
 </div>
 <script>
 const log = document.getElementById('log');
