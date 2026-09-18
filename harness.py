@@ -268,6 +268,19 @@ function refreshPreview() {
   }
 }
 
+// This page runs inside chassis's create-app iframe, so it unloads
+// whenever that outer tab is closed, reloaded, or navigated away from -
+// close the preview window along with it rather than leaving an orphaned
+// popup behind. A window can still be closed by the script that opened
+// it even after the popup itself has navigated elsewhere (e.g. following
+// a chat-driven refresh), so this works regardless of what's currently
+// loaded in it.
+window.addEventListener('pagehide', () => {
+  if (previewWindow && !previewWindow.closed) {
+    previewWindow.close();
+  }
+});
+
 document.getElementById('preview-computer-btn').addEventListener('click', () => openPreview('computer'));
 document.getElementById('preview-mobile-btn').addEventListener('click', () => openPreview('mobile'));
 
