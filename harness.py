@@ -19,7 +19,7 @@ import anthropic
 SITE_DIR = Path(__file__).parent / "site"
 ALLOWED_FILES = ("index.html", "styles.css", "client.js")
 
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL = os.environ.get("MODEL", "claude-sonnet-5")
 BUDGET_USD = float(os.environ.get("BUDGET_USD", "1.00"))
 PORT = int(os.environ.get("PORT", "8080"))
@@ -73,7 +73,7 @@ TOOLS = [
     },
 ]
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 _lock = threading.Lock()
 _state = {
@@ -135,6 +135,8 @@ def _run_tool(name: str, tool_input: dict) -> str:
 
 
 def run_chat_turn(user_message: str) -> dict:
+    if client is None:
+        return {"error": "no_api_key", "cost_usd": 0.0}
     with _lock:
         if _state["status"] != "building":
             return {"error": _state["status"], "cost_usd": _state["cost_usd"]}
