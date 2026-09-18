@@ -202,16 +202,16 @@ INDEX_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <title>Build your app</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
-  #chat-pane { width: 380px; display: flex; flex-direction: column; border-right: 1px solid #ccc; padding: 12px; box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; display: flex; justify-content: center; height: 100vh; }
+  #chat-pane { width: 100%; max-width: 560px; display: flex; flex-direction: column; padding: 12px; box-sizing: border-box; }
   #log { flex: 1; overflow-y: auto; font-size: 14px; }
   #log .msg { margin-bottom: 10px; white-space: pre-wrap; }
   #log .user { color: #333; font-weight: 600; }
   #log .assistant { color: #0a5; }
   #status-bar { font-size: 12px; color: #666; margin-bottom: 8px; }
   textarea { width: 100%; box-sizing: border-box; }
-  #preview-pane { flex: 1; display: flex; flex-direction: column; }
-  #preview-pane iframe { flex: 1; border: none; }
+  #preview-buttons { display: flex; gap: 8px; margin-top: 6px; }
+  #preview-buttons button { flex: 1; }
   button { margin-top: 6px; }
   #publish-btn { background: #0a5; color: white; border: none; padding: 8px; cursor: pointer; }
   #publish-btn:disabled { background: #999; cursor: default; }
@@ -221,12 +221,13 @@ INDEX_PAGE = """<!doctype html>
 <div id="chat-pane">
   <div id="status-bar">status: <span id="status">building</span> - cost: $<span id="cost">0.0000</span> / $<span id="budget">?</span></div>
   <div id="log"></div>
+  <div id="preview-buttons">
+    <button id="preview-computer-btn">Preview (Computer)</button>
+    <button id="preview-mobile-btn">Preview (Mobile)</button>
+  </div>
   <textarea id="input" rows="3" placeholder="Describe what you want..."></textarea>
   <button id="send-btn">Send</button>
   <button id="publish-btn">Publish</button>
-</div>
-<div id="preview-pane">
-  <iframe id="preview" src="/preview/index.html"></iframe>
 </div>
 <script>
 const log = document.getElementById('log');
@@ -236,7 +237,39 @@ const publishBtn = document.getElementById('publish-btn');
 const statusEl = document.getElementById('status');
 const costEl = document.getElementById('cost');
 const budgetEl = document.getElementById('budget');
-const preview = document.getElementById('preview');
+
+// The live preview opens in its own window rather than an inline iframe,
+// so it can be sized like a real device viewport (window.open's
+// width/height only size the outer window, not the content area, so this
+// is an approximation - close enough to trigger real CSS breakpoints,
+// not pixel-perfect device emulation). Kept as a plain window reference
+// (not reopened every time) so repeat clicks resize/reuse the same
+// window, and so a chat turn can refresh its content without needing a
+// new user gesture (window.open outside a click handler risks being
+// popup-blocked; navigating an already-open window is not).
+let previewWindow = null;
+
+function openPreview(kind) {
+  const width = kind === 'mobile' ? 390 : 1280;
+  const height = kind === 'mobile' ? 844 : 800;
+  const url = '/preview/index.html?t=' + Date.now();
+  if (previewWindow && !previewWindow.closed) {
+    previewWindow.resizeTo(width, height);
+    previewWindow.location.href = url;
+    previewWindow.focus();
+  } else {
+    previewWindow = window.open(url, 'app-preview', `width=${width},height=${height}`);
+  }
+}
+
+function refreshPreview() {
+  if (previewWindow && !previewWindow.closed) {
+    previewWindow.location.href = '/preview/index.html?t=' + Date.now();
+  }
+}
+
+document.getElementById('preview-computer-btn').addEventListener('click', () => openPreview('computer'));
+document.getElementById('preview-mobile-btn').addEventListener('click', () => openPreview('mobile'));
 
 function addMsg(role, text) {
   const div = document.createElement('div');
@@ -275,7 +308,7 @@ async function send() {
       addMsg('assistant', 'Error: ' + j.error);
     } else {
       addMsg('assistant', j.reply || '(no reply)');
-      preview.src = '/preview/index.html?t=' + Date.now();
+      refreshPreview();
     }
   } finally {
     await refreshStatus();
