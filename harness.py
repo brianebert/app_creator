@@ -38,6 +38,86 @@ CACHE_READ_MULTIPLIER = 0.10
 
 MAX_TOOL_ITERATIONS = 8
 
+# Real, working reference patterns for the platform that will eventually
+# serve this site - copied from that platform's own client code (chat.js),
+# not reconstructed from memory, so the shapes here (route names, param
+# names, response fields) are exactly correct rather than plausible-looking.
+# None of this can be exercised from inside this preview: the sandbox this
+# chat session runs in has no network route to that platform at all, only
+# outbound access to the Anthropic API. It only starts working once the
+# finished site is actually imported - the model is told this explicitly
+# below so it can pass the caveat on to the user rather than presenting a
+# feature that looks broken as if it should already work here.
+CHASSIS_REFERENCE = """
+
+If the user wants something that needs shared, multi-visitor data - a
+chat room, guestbook, live feed, or anything else visitors write and
+read back - you can write real, working client-side code for it against
+the platform that will host this site, using the patterns below. It will
+NOT do anything in this preview (the sandbox you're running in has no
+route to that platform); it starts working the moment the user imports
+the finished site, because at that point the site is served BY the same
+platform these calls target, from the same origin. Say this plainly to
+the user whenever you add a feature like this, so a silently "broken"
+preview doesn't read as a bug.
+
+Always resolve calls relative to the page's own current URL, never a
+hardcoded origin or absolute path - the site's eventual mount point (by
+name, by an opaque id, possibly behind a reverse-proxy prefix) isn't
+something this code can know in advance:
+
+  const API_BASE = new URL('.', window.location.href);
+  function apiUrl(path) { return new URL(path, API_BASE).toString(); }
+  async function fetchJson(path, options) {
+    const response = await fetch(apiUrl(path), options);
+    if (!response.ok) throw new Error(`${path}: ${response.status}`);
+    return response.json();
+  }
+
+The simple, common case - one shared feed living on this site's own
+document (a guestbook, a comment thread, a single chat room) - needs no
+setup step and no credential in the request; write access is a property
+of the server that ends up hosting the site, not of who's asking:
+
+  // write one entry
+  const body = JSON.stringify({sender, ts: Date.now(), text});
+  const blob = await fetchJson('blob', {method: 'POST', body});
+  const key = `msg/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await fetchJson(`doc/${key}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hash: blob.hash, size: blob.size}),
+  });
+
+  // read entries back - poll this on an interval for something "live"
+  const entries = await fetchJson('doc?prefix=msg/&inline=1');
+  // each entry: {key, hash, size, content} - content is the stored
+  // bytes as text, present because inline=1 and the blob is small
+
+If the user wants several independent rooms/threads rather than one
+shared feed, mint a separate document per room (a bare POST /doc with no
+ticket creates one; a ticket means "import an existing one" instead) and
+keep a {namespace, ticket} pointer to it under this site's own
+`topics/<name>` key, then address that room's own document explicitly by
+namespace for its own entries:
+
+  const params = new URLSearchParams({name: roomName, listed: '0'});
+  const {namespace, write_ticket} = await fetchJson(`doc?${params}`, {method: 'POST'});
+  const pointerBlob = await fetchJson('blob', {
+    method: 'POST', body: JSON.stringify({namespace, ticket: write_ticket}),
+  });
+  await fetchJson(`doc/topics/${encodeURIComponent(roomName)}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hash: pointerBlob.hash, size: pointerBlob.size}),
+  });
+
+  function documentsUrl(namespace, path) {
+    return new URL(`/documents/${namespace}/${path}`, window.location.origin).toString();
+  }
+  // then read/write that room's own msg/* entries via documentsUrl(namespace, ...)
+  // in place of the plain paths in the simple case above
+"""
+
 SYSTEM_PROMPT = (
     "You are building a small static website for a user, one file at a "
     "time, using the read_file and write_file tools. You may only read or "
@@ -47,6 +127,7 @@ SYSTEM_PROMPT = (
     "rewriting everything each turn. When you believe the site satisfies "
     "the user's request, say so in your reply, but do not publish it "
     "yourself - only the user can do that."
+    + CHASSIS_REFERENCE
 )
 
 TOOLS = [
@@ -150,7 +231,11 @@ def run_chat_turn(user_message: str) -> dict:
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            # Cached: SYSTEM_PROMPT is identical on every turn of a session
+            # and grew substantially once CHASSIS_REFERENCE was added - the
+            # cost formula below already accounted for cache pricing, this
+            # is what actually turns it on.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             messages=messages,
             tools=TOOLS,
         )
