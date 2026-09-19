@@ -80,6 +80,7 @@ _state = {
     "status": "building",  # "building" | "published" | "budget_exhausted"
     "cost_usd": 0.0,
     "messages": [],
+    "name": None,  # set by /publish; stays None if budget ran out first
 }
 
 
@@ -215,7 +216,9 @@ INDEX_PAGE = """<!doctype html>
   #preview-buttons { display: flex; gap: 8px; margin-top: 6px; }
   #preview-buttons button { flex: 1; }
   button { margin-top: 6px; }
-  #publish-btn { background: #0a5; color: white; border: none; padding: 8px; cursor: pointer; }
+  #publish-row { display: flex; gap: 8px; margin-top: 6px; }
+  #app-name { flex: 1; box-sizing: border-box; }
+  #publish-btn { background: #0a5; color: white; border: none; padding: 8px; cursor: pointer; margin-top: 0; }
   #publish-btn:disabled { background: #999; cursor: default; }
 </style>
 </head>
@@ -229,13 +232,17 @@ INDEX_PAGE = """<!doctype html>
   </div>
   <textarea id="input" rows="3" placeholder="Describe what you want..."></textarea>
   <button id="send-btn">Send</button>
-  <button id="publish-btn">Import</button>
+  <div id="publish-row">
+    <input id="app-name" type="text" placeholder="App name">
+    <button id="publish-btn">Import</button>
+  </div>
 </div>
 <script>
 const log = document.getElementById('log');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send-btn');
 const publishBtn = document.getElementById('publish-btn');
+const nameInput = document.getElementById('app-name');
 const statusEl = document.getElementById('status');
 const costEl = document.getElementById('cost');
 const budgetEl = document.getElementById('budget');
@@ -304,6 +311,8 @@ async function refreshStatus() {
   input.disabled = disabled;
   sendBtn.disabled = disabled;
   publishBtn.disabled = disabled;
+  nameInput.disabled = disabled;
+  if (j.name && !nameInput.value) nameInput.value = j.name;
 }
 
 async function send() {
@@ -331,8 +340,25 @@ async function send() {
 }
 
 publishBtn.addEventListener('click', async () => {
+  const name = nameInput.value.trim();
+  if (!name) {
+    alert('Give the app a name first.');
+    nameInput.focus();
+    return;
+  }
   publishBtn.disabled = true;
-  await fetch('/publish', {method: 'POST'});
+  nameInput.disabled = true;
+  const r = await fetch('/publish', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name}),
+  });
+  if (!r.ok) {
+    alert('Import failed: ' + (await r.text()));
+    publishBtn.disabled = false;
+    nameInput.disabled = false;
+    return;
+  }
   await refreshStatus();
 });
 
@@ -398,6 +424,7 @@ class Handler(BaseHTTPRequestHandler):
                         "status": _state["status"],
                         "cost_usd": _state["cost_usd"],
                         "budget_usd": BUDGET_USD,
+                        "name": _state["name"],
                     }
                 )
         elif path == "/export":
@@ -441,11 +468,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(result)
         elif path == "/publish":
+            name = (payload.get("name") or "").strip()
+            if not name:
+                self._send_json({"error": "name required"}, status=400)
+                return
             with _lock:
+                _state["name"] = name
                 if _state["status"] != "budget_exhausted":
                     _state["status"] = "published"
                 status, cost = _state["status"], _state["cost_usd"]
-            self._send_json({"status": status, "cost_usd": cost})
+            self._send_json({"status": status, "cost_usd": cost, "name": name})
         else:
             self._send_json({"error": "not found"}, status=404)
 
