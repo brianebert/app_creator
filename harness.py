@@ -17,7 +17,11 @@ from urllib.parse import urlparse
 import anthropic
 
 SITE_DIR = Path(__file__).parent / "site"
-ALLOWED_FILES = ("index.html", "styles.css", "client.js")
+# chat-widget.js is a pre-seeded, ready-made component (see CHASSIS_REFERENCE
+# below) - listed here so it's read/write-able like the other three, and so
+# /export and /preview serve it, but the model isn't expected to write it
+# from scratch the way it does index.html/styles.css/client.js.
+ALLOWED_FILES = ("index.html", "styles.css", "client.js", "chat-widget.js")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL = os.environ.get("MODEL", "claude-sonnet-5")
@@ -60,6 +64,46 @@ the finished site, because at that point the site is served BY the same
 platform these calls target, from the same origin. Say this plainly to
 the user whenever you add a feature like this, so a silently "broken"
 preview doesn't read as a bug.
+
+For a CHAT feature specifically, a ready-made, already-styled component is
+always present in this site's own files - `chat-widget.js`, alongside
+index.html/styles.css/client.js. Prefer it over hand-writing chat bubbles
+from scratch: it matches this platform's own standalone chat app
+pixel-for-pixel (same colors, same speech-bubble shapes, same self/other
+logic), so a chat feature built this way looks like a native part of the
+platform rather than a bespoke reskin. Wire it up with:
+
+  <div id="chat"></div>
+  <script src="chat-widget.js"></script>
+  <script>
+    mountChatTopic(document.getElementById('chat'), {topicName: 'general'});
+  </script>
+
+By default it mints its own private feed the first time someone sends a
+message - no setup step, no ticket, same underlying mechanism as the
+guestbook/feed pattern below, just pre-styled and pre-wired. Only fall back
+to the raw patterns further below if the user wants something chat-widget.js
+doesn't cover (a non-chat feed/guestbook with custom fields, or a fully
+custom visual style the user explicitly asked for instead of the platform's
+own look).
+
+If the user wants THIS widget to share one live conversation with the
+platform's own standalone chat app (visible and postable from both
+places), pass `namespace` and `writeTicket` for a topic the user already
+created there through its own "New Topic" button, and gave you the ticket
+for (visible via that topic's own share/ticket action). Generated code has
+no way to mint a topic the chat app will also discover on its own - only a
+topic the user creates in the chat app first can be shared this way:
+
+  mountChatTopic(document.getElementById('chat'), {
+    topicName: 'general',
+    namespace: '<namespace the user gave you>',
+    writeTicket: '<write ticket the user gave you>',
+  });
+
+Read `chat-widget.js` (via read_file) before customizing chat behavior -
+it's plain, commented JS, not a black box, and documents both modes above
+in its own header comment.
 
 Always resolve calls relative to the page's own current URL, never a
 hardcoded origin or absolute path - the site's eventual mount point (by
@@ -121,8 +165,11 @@ namespace for its own entries:
 SYSTEM_PROMPT = (
     "You are building a small static website for a user, one file at a "
     "time, using the read_file and write_file tools. You may only read or "
-    "write these files: index.html, styles.css, client.js - there is no "
-    "other filesystem access. Keep the site self-contained. Make small, "
+    "write these files: index.html, styles.css, client.js, chat-widget.js "
+    "- there is no other filesystem access. chat-widget.js is a ready-made, "
+    "already-styled chat component (see below) - read it before editing "
+    "it, and prefer using it as-is over writing chat UI from scratch. Keep "
+    "the site self-contained. Make small, "
     "incremental edits in response to each user request rather than "
     "rewriting everything each turn. When you believe the site satisfies "
     "the user's request, say so in your reply, but do not publish it "
