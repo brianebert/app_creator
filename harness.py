@@ -10,6 +10,7 @@ import mimetypes
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,6 +29,16 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL = os.environ.get("MODEL", "claude-sonnet-5")
 BUDGET_USD = float(os.environ.get("BUDGET_USD", "1.00"))
 PORT = int(os.environ.get("PORT", "8080"))
+
+# Tenki's own default sandbox session lifetime (confirmed live 2026-09-30
+# against a real CreateSession response: timeoutAt was exactly 30 minutes
+# after createdAt) - the platform kills the sandbox at this point
+# regardless of anything the harness does, so this is a real countdown to
+# match against, not an arbitrary pick. There is no way to read this value
+# from inside the sandbox itself (Tenki's timeoutAt is chassis-side only,
+# never passed into CreateSession's env) - if Tenki's default ever
+# changes, update this constant to match.
+SESSION_MAX_LIFETIME_SECS = 30 * 60
 
 # Per-MTok input/output rates. Confirmed live against the real Anthropic API
 # during design (2026-09): Sonnet 5 is $2/$10. Verify current published
@@ -255,7 +266,33 @@ _state = {
     # the page's own fast interval during a turn to show a "Nobody says..."
     # line - see NOBODY_SAYINGS in INDEX_PAGE.
     "activity": None,
+    # Wall-clock time of this session's first real request - deliberately
+    # NOT set here at module level. The active Tenki template is a
+    # memory-snapshot one: this whole module only ever actually executes
+    # once, at template BUILD time: every real session is a restored copy
+    # of that exact frozen process memory, so a value set here would be the
+    # build's own timestamp in every session, not that session's real
+    # start. Set lazily instead, in _ensure_session_start() below, the
+    # first time any request actually lands in a given restored copy - this
+    # correctly gives each session its own real start time regardless of
+    # when the template was built.
+    "session_start": None,
 }
+
+
+def _ensure_session_start() -> None:
+    with _lock:
+        if _state["session_start"] is None:
+            _state["session_start"] = time.time()
+
+
+def _time_remaining_pct() -> float:
+    with _lock:
+        start = _state["session_start"]
+    if start is None:
+        return 100.0
+    elapsed = time.time() - start
+    return max(0.0, 100.0 * (1 - elapsed / SESSION_MAX_LIFETIME_SECS))
 
 
 def _rate_for(model: str) -> dict:
@@ -382,12 +419,17 @@ def run_chat_turn(user_message: str) -> dict:
         with _lock:
             _state["activity"] = None
 
+    # _time_remaining_pct() takes _lock itself - computed before entering
+    # the block below, since Lock isn't reentrant.
+    time_remaining_pct = _time_remaining_pct()
     with _lock:
         _state["messages"] = messages
         return {
             "reply": final_text,
             "status": _state["status"],
             "cost_usd": _state["cost_usd"],
+            "budget_usd": BUDGET_USD,
+            "time_remaining_pct": time_remaining_pct,
         }
 
 
@@ -473,13 +515,18 @@ function nobodySaying(activity) {
   return template.replace('{path}', activity.path || '');
 }
 
-// Token-budget reminders: no persistent dollar figure shown at all - just
-// a transient reminder the first time remaining tokens (cost_usd against
-// BUDGET_USD is the proxy the harness already tracks) crosses down through
-// 50%, 25%, or 10%, self-removed 10s after it appears. Tracked per
-// threshold so each only ever fires once per session (page load).
-const TOKEN_THRESHOLDS = [50, 25, 10];
+// Budget/time reminders: no persistent dollar figure or countdown shown at
+// all - just a transient reminder, self-removed 10s after it appears, the
+// first time either resource's remaining percentage crosses down through
+// 50%, 25%, or 10%. Tracked per threshold per resource so each only ever
+// fires once per session (page load). Checked from two places: the 5s
+// refreshStatus() poll (a safety net - e.g. while idle, time still ticks
+// down), and directly off the /chat response the instant a reply lands
+// (tokens only actually change when the model has returned with
+// something, so that's the real event to react to, not a fixed timer).
+const THRESHOLDS = [50, 25, 10];
 const tokenThresholdsShown = new Set();
+const timeThresholdsShown = new Set();
 let toastTimer = null;
 
 function showToast(message) {
@@ -489,15 +536,23 @@ function showToast(message) {
   toastTimer = setTimeout(() => { toastEl.style.display = 'none'; }, 10000);
 }
 
-function checkTokenBudget(costUsd, budgetUsd) {
+function checkThresholds(costUsd, budgetUsd, timeRemainingPct) {
   if (!budgetUsd) return;
-  const remainingPct = Math.max(0, Math.round(100 * (1 - costUsd / budgetUsd)));
-  for (const threshold of TOKEN_THRESHOLDS) {
-    if (remainingPct <= threshold && !tokenThresholdsShown.has(threshold)) {
+  const tokenPct = Math.max(0, Math.round(100 * (1 - costUsd / budgetUsd)));
+  const timePct = Math.max(0, Math.round(timeRemainingPct));
+  let crossed = false;
+  for (const threshold of THRESHOLDS) {
+    if (tokenPct <= threshold && !tokenThresholdsShown.has(threshold)) {
       tokenThresholdsShown.add(threshold);
-      showToast(`Heads up - about ${remainingPct}% of this session's token budget remains.`);
-      break;
+      crossed = true;
     }
+    if (timePct <= threshold && !timeThresholdsShown.has(threshold)) {
+      timeThresholdsShown.add(threshold);
+      crossed = true;
+    }
+  }
+  if (crossed) {
+    showToast(`Heads up - about ${tokenPct}% of tokens and ${timePct}% of time remain.`);
   }
 }
 
@@ -559,7 +614,7 @@ async function refreshStatus() {
   const r = await fetch('/status');
   const j = await r.json();
   statusEl.textContent = j.status;
-  checkTokenBudget(j.cost_usd, j.budget_usd);
+  checkThresholds(j.cost_usd, j.budget_usd, j.time_remaining_pct);
   const disabled = j.status !== 'building';
   input.disabled = disabled;
   sendBtn.disabled = disabled;
@@ -602,6 +657,11 @@ async function send() {
       addMsg('assistant', 'Error: ' + j.error);
     } else {
       addMsg('assistant', j.reply || '(no reply)');
+      // Checked right here, off this response's own numbers, rather than
+      // waiting for the next poll - tokens only actually change when the
+      // model has just returned with something, so this is the real event
+      // to react to.
+      checkThresholds(j.cost_usd, j.budget_usd, j.time_remaining_pct);
       refreshPreview();
     }
   } finally {
@@ -686,10 +746,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        _ensure_session_start()
         path = urlparse(self.path).path
         if path == "/":
             self._send_html(INDEX_PAGE)
         elif path == "/status":
+            # _time_remaining_pct() takes _lock itself - computed before
+            # entering this block, since Lock isn't reentrant.
+            time_remaining_pct = _time_remaining_pct()
             with _lock:
                 self._send_json(
                     {
@@ -698,6 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                         "budget_usd": BUDGET_USD,
                         "name": _state["name"],
                         "activity": _state["activity"],
+                        "time_remaining_pct": time_remaining_pct,
                     }
                 )
         elif path == "/export":
@@ -720,6 +785,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
+        _ensure_session_start()
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
