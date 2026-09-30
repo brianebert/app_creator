@@ -250,6 +250,11 @@ _state = {
     "cost_usd": 0.0,
     "messages": [],
     "name": None,  # set by /publish; stays None if budget ran out first
+    # {"phase": "thinking"} or {"phase": "read_file"|"write_file", "path": ...}
+    # while a /chat turn is in progress; None the rest of the time. Polled by
+    # the page's own fast interval during a turn to show a "Nobody says..."
+    # line - see NOBODY_SAYINGS in INDEX_PAGE.
+    "activity": None,
 }
 
 
@@ -315,53 +320,67 @@ def run_chat_turn(user_message: str) -> dict:
 
     final_text = ""
     budget_exhausted = False
-    for _ in range(MAX_TOOL_ITERATIONS):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            # Cached: SYSTEM_PROMPT is identical on every turn of a session
-            # and grew substantially once CHASSIS_REFERENCE was added - the
-            # cost formula below already accounted for cache pricing, this
-            # is what actually turns it on.
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            messages=messages,
-            tools=TOOLS,
-        )
+    try:
+        for _ in range(MAX_TOOL_ITERATIONS):
+            with _lock:
+                _state["activity"] = {"phase": "thinking"}
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                # Cached: SYSTEM_PROMPT is identical on every turn of a session
+                # and grew substantially once CHASSIS_REFERENCE was added - the
+                # cost formula below already accounted for cache pricing, this
+                # is what actually turns it on.
+                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                messages=messages,
+                tools=TOOLS,
+            )
 
-        with _lock:
-            _state["cost_usd"] += _turn_cost_usd(response.usage)
-            budget_exhausted = _state["cost_usd"] >= BUDGET_USD
-            if budget_exhausted:
-                _state["status"] = "budget_exhausted"
+            with _lock:
+                _state["cost_usd"] += _turn_cost_usd(response.usage)
+                budget_exhausted = _state["cost_usd"] >= BUDGET_USD
+                if budget_exhausted:
+                    _state["status"] = "budget_exhausted"
 
-        assistant_content = [block.model_dump() for block in response.content]
-        messages.append({"role": "assistant", "content": assistant_content})
-        final_text = "\n".join(
-            block.text for block in response.content if block.type == "text"
-        )
+            assistant_content = [block.model_dump() for block in response.content]
+            messages.append({"role": "assistant", "content": assistant_content})
+            final_text = "\n".join(
+                block.text for block in response.content if block.type == "text"
+            )
 
-        if budget_exhausted or response.stop_reason != "tool_use":
-            break
+            if budget_exhausted or response.stop_reason != "tool_use":
+                break
 
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            try:
-                result = _run_tool(block.name, block.input)
-                tool_results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                )
-            except Exception as exc:
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(exc),
-                        "is_error": True,
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                with _lock:
+                    _state["activity"] = {
+                        "phase": block.name,
+                        "path": block.input.get("path"),
                     }
-                )
-        messages.append({"role": "user", "content": tool_results})
+                try:
+                    result = _run_tool(block.name, block.input)
+                    tool_results.append(
+                        {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                    )
+                except Exception as exc:
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(exc),
+                            "is_error": True,
+                        }
+                    )
+            messages.append({"role": "user", "content": tool_results})
+    finally:
+        # Always cleared, even if client.messages.create raised - otherwise
+        # a failed turn would leave a stale "Nobody is ..." line showing
+        # forever, since nothing else would ever set activity back to None.
+        with _lock:
+            _state["activity"] = None
 
     with _lock:
         _state["messages"] = messages
@@ -384,7 +403,9 @@ INDEX_PAGE = """<!doctype html>
   #log .msg { margin-bottom: 10px; white-space: pre-wrap; }
   #log .user { color: #333; font-weight: 600; }
   #log .assistant { color: #0a5; }
-  #status-bar { font-size: 12px; color: #666; margin-bottom: 8px; }
+  #status-bar { font-size: 12px; color: #666; margin-bottom: 4px; }
+  #nobody-says { font-size: 12px; color: #888; font-style: italic; min-height: 1.4em; margin-bottom: 8px; }
+  #toast { font-size: 12px; background: #fff3cd; border: 1px solid #e0c46c; border-radius: 4px; padding: 6px 10px; margin-bottom: 8px; display: none; }
   textarea { width: 100%; box-sizing: border-box; }
   #preview-buttons { display: flex; gap: 8px; margin-top: 6px; }
   #preview-buttons button { flex: 1; }
@@ -397,7 +418,9 @@ INDEX_PAGE = """<!doctype html>
 </head>
 <body>
 <div id="chat-pane">
-  <div id="status-bar">status: <span id="status">building</span> - cost: $<span id="cost">0.0000</span> / $<span id="budget">?</span></div>
+  <div id="status-bar">status: <span id="status">building</span></div>
+  <div id="toast"></div>
+  <div id="nobody-says"></div>
   <div id="log"></div>
   <div id="preview-buttons">
     <button id="preview-computer-btn">Preview (Computer)</button>
@@ -417,8 +440,66 @@ const sendBtn = document.getElementById('send-btn');
 const publishBtn = document.getElementById('publish-btn');
 const nameInput = document.getElementById('app-name');
 const statusEl = document.getElementById('status');
-const costEl = document.getElementById('cost');
-const budgetEl = document.getElementById('budget');
+const nobodySaysEl = document.getElementById('nobody-says');
+const toastEl = document.getElementById('toast');
+
+// Whimsical stand-ins for a plain "working..." spinner while a /chat turn
+// is in progress - several variants per phase, picked at random on each
+// fast poll tick so it feels alive rather than static. {path} is filled in
+// for the file-tool phases.
+const NOBODY_SAYINGS = {
+  thinking: [
+    "Nobody knows the answer yet - give it a moment.",
+    "Nobody rushes a good decision.",
+    "Nobody is turning that over.",
+    "Nobody has a plan. Just a sec.",
+  ],
+  read_file: [
+    "Nobody is reading {path}.",
+    "Nobody just took a look at {path}.",
+    "Nobody double-checked {path}.",
+  ],
+  write_file: [
+    "Nobody is writing to {path}.",
+    "Nobody just updated {path}.",
+    "Nobody put some finishing touches on {path}.",
+  ],
+};
+
+function nobodySaying(activity) {
+  if (!activity) return '';
+  const variants = NOBODY_SAYINGS[activity.phase] || NOBODY_SAYINGS.thinking;
+  const template = variants[Math.floor(Math.random() * variants.length)];
+  return template.replace('{path}', activity.path || '');
+}
+
+// Token-budget reminders: no persistent dollar figure shown at all - just
+// a transient reminder the first time remaining tokens (cost_usd against
+// BUDGET_USD is the proxy the harness already tracks) crosses down through
+// 50%, 25%, or 10%, self-removed 10s after it appears. Tracked per
+// threshold so each only ever fires once per session (page load).
+const TOKEN_THRESHOLDS = [50, 25, 10];
+const tokenThresholdsShown = new Set();
+let toastTimer = null;
+
+function showToast(message) {
+  toastEl.textContent = message;
+  toastEl.style.display = 'block';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.style.display = 'none'; }, 10000);
+}
+
+function checkTokenBudget(costUsd, budgetUsd) {
+  if (!budgetUsd) return;
+  const remainingPct = Math.max(0, Math.round(100 * (1 - costUsd / budgetUsd)));
+  for (const threshold of TOKEN_THRESHOLDS) {
+    if (remainingPct <= threshold && !tokenThresholdsShown.has(threshold)) {
+      tokenThresholdsShown.add(threshold);
+      showToast(`Heads up - about ${remainingPct}% of this session's token budget remains.`);
+      break;
+    }
+  }
+}
 
 // The live preview opens in its own window rather than an inline iframe,
 // so it can be sized like a real device viewport (window.open's
@@ -478,14 +559,28 @@ async function refreshStatus() {
   const r = await fetch('/status');
   const j = await r.json();
   statusEl.textContent = j.status;
-  costEl.textContent = j.cost_usd.toFixed(4);
-  budgetEl.textContent = j.budget_usd.toFixed(2);
+  checkTokenBudget(j.cost_usd, j.budget_usd);
   const disabled = j.status !== 'building';
   input.disabled = disabled;
   sendBtn.disabled = disabled;
   publishBtn.disabled = disabled;
   nameInput.disabled = disabled;
   if (j.name && !nameInput.value) nameInput.value = j.name;
+  return j;
+}
+
+// Polls /status quickly while a /chat turn is in flight, purely to render
+// NOBODY_SAYINGS from the backend's current activity - independent of, and
+// much faster than, the 5s refreshStatus() interval below.
+async function pollActivity() {
+  try {
+    const r = await fetch('/status');
+    const j = await r.json();
+    nobodySaysEl.textContent = nobodySaying(j.activity);
+  } catch (err) {
+    // A transient failure here just means one blank tick - not worth
+    // interrupting the chat request itself over.
+  }
 }
 
 async function send() {
@@ -494,6 +589,8 @@ async function send() {
   addMsg('user', message);
   input.value = '';
   sendBtn.disabled = true;
+  nobodySaysEl.textContent = nobodySaying({phase: 'thinking'});
+  const activityTimer = setInterval(pollActivity, 1200);
   try {
     const r = await fetch('/chat', {
       method: 'POST',
@@ -508,6 +605,8 @@ async function send() {
       refreshPreview();
     }
   } finally {
+    clearInterval(activityTimer);
+    nobodySaysEl.textContent = '';
     await refreshStatus();
   }
 }
@@ -598,6 +697,7 @@ class Handler(BaseHTTPRequestHandler):
                         "cost_usd": _state["cost_usd"],
                         "budget_usd": BUDGET_USD,
                         "name": _state["name"],
+                        "activity": _state["activity"],
                     }
                 )
         elif path == "/export":
