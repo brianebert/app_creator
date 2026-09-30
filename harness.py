@@ -213,6 +213,38 @@ namespace for its own entries:
   // in place of the plain paths in the simple case above
 """
 
+# Appended to the user's own message on every /chat turn (not folded into
+# SYSTEM_PROMPT, deliberately - this needs to read as part of what the user
+# just asked, so the model treats "parse this out into short tasks" as one
+# of the things it's now been asked to do, not a standing background rule
+# it can quietly deprioritize). Exists because a long turn (many tool
+# iterations, or one slow generation) previously showed nothing more
+# specific than a generic "thinking" line the whole time - indistinguishable
+# from a genuinely hung sandbox. Instructing the model to narrate its own
+# real subtasks, in its own words, gives the polling "Nobody says..." line
+# actual content instead of a canned phrase repeating unchanged.
+TASK_STATUS_INSTRUCTIONS = """
+
+Before doing anything else this turn - including before you finish acting \
+on these very instructions - say so: your first status line should \
+announce that you're planning the work. Then break the work needed to \
+satisfy the request above into a short sequence of subtasks, each about \
+one minute of your own effort (a small edit is often only one or two \
+subtasks - don't invent extra ones just to pad the count).
+
+For EVERY subtask, including the first:
+  - Write one short status line, third person, in the voice "Nobody is \
+<doing something>." or "Nobody just <did something>.", on its own line, \
+BEFORE calling any tools for that subtask.
+  - Do the subtask's work (its tool calls).
+  - Write one more such line noting what you just finished, before moving \
+on to the next subtask.
+
+These status lines are progress narration, not your answer to the user - \
+keep each one to one short sentence. Once every subtask is done, give your \
+normal final reply WITHOUT repeating this narration in it.
+"""
+
 SYSTEM_PROMPT = (
     "You are building a small static website for a user, one file at a "
     "time, using the read_file and write_file tools. You may only read or "
@@ -352,15 +384,27 @@ def run_chat_turn(user_message: str) -> dict:
     with _lock:
         if _state["status"] != "building":
             return {"error": _state["status"], "cost_usd": _state["cost_usd"]}
-        _state["messages"].append({"role": "user", "content": user_message})
+        _state["messages"].append(
+            {"role": "user", "content": user_message + TASK_STATUS_INSTRUCTIONS}
+        )
         messages = list(_state["messages"])
 
     final_text = ""
     budget_exhausted = False
+    # The model's own narration of its current subtask (see
+    # TASK_STATUS_INSTRUCTIONS), shown in place of the generic canned
+    # phrases once it starts arriving - carried forward across both the
+    # (near-instant) tool-execution gap and the next, possibly slow,
+    # generation, until replaced by newer narration.
+    last_status_text = None
     try:
         for _ in range(MAX_TOOL_ITERATIONS):
             with _lock:
-                _state["activity"] = {"phase": "thinking"}
+                _state["activity"] = (
+                    {"phase": "status", "text": last_status_text}
+                    if last_status_text
+                    else {"phase": "thinking"}
+                )
             response = client.messages.create(
                 model=MODEL,
                 max_tokens=4096,
@@ -388,15 +432,22 @@ def run_chat_turn(user_message: str) -> dict:
             if budget_exhausted or response.stop_reason != "tool_use":
                 break
 
+            status_text = final_text.strip()
+            if status_text:
+                last_status_text = status_text
+                with _lock:
+                    _state["activity"] = {"phase": "status", "text": last_status_text}
+
             tool_results = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
                 with _lock:
-                    _state["activity"] = {
-                        "phase": block.name,
-                        "path": block.input.get("path"),
-                    }
+                    _state["activity"] = (
+                        {"phase": "status", "text": last_status_text}
+                        if last_status_text
+                        else {"phase": block.name, "path": block.input.get("path")}
+                    )
                 try:
                     result = _run_tool(block.name, block.input)
                     tool_results.append(
@@ -510,6 +561,11 @@ const NOBODY_SAYINGS = {
 
 function nobodySaying(activity) {
   if (!activity) return '';
+  // "status" is the model's own real-time narration of its current subtask
+  // (see TASK_STATUS_INSTRUCTIONS in harness.py) - shown verbatim in place
+  // of a canned phrase, since it's more specific and proves the model is
+  // actually making progress rather than stuck.
+  if (activity.phase === 'status') return activity.text || '';
   const variants = NOBODY_SAYINGS[activity.phase] || NOBODY_SAYINGS.thinking;
   const template = variants[Math.floor(Math.random() * variants.length)];
   return template.replace('{path}', activity.path || '');
