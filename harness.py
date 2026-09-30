@@ -17,11 +17,12 @@ from urllib.parse import urlparse
 import anthropic
 
 SITE_DIR = Path(__file__).parent / "site"
-# chat-widget.js is a pre-seeded, ready-made component (see CHASSIS_REFERENCE
-# below) - listed here so it's read/write-able like the other three, and so
-# /export and /preview serve it, but the model isn't expected to write it
-# from scratch the way it does index.html/styles.css/client.js.
-ALLOWED_FILES = ("index.html", "styles.css", "client.js", "chat-widget.js")
+# chat-widget.js and payment-widget.js are pre-seeded, ready-made components
+# (see CHASSIS_REFERENCE below) - listed here so they're read/write-able
+# like the other three, and so /export and /preview serve them, but the
+# model isn't expected to write them from scratch the way it does
+# index.html/styles.css/client.js.
+ALLOWED_FILES = ("index.html", "styles.css", "client.js", "chat-widget.js", "payment-widget.js")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL = os.environ.get("MODEL", "claude-sonnet-5")
@@ -105,6 +106,45 @@ Read `chat-widget.js` (via read_file) before customizing chat behavior -
 it's plain, commented JS, not a black box, and documents both modes above
 in its own header comment.
 
+For a PAYMENT feature - charging a real price in crypto for something on
+this site - a ready-made component is likewise always present:
+`payment-widget.js`. It drives the wallet (Freighter for Stellar, MetaMask
+for Ethereum/Polygon) to build and sign a real USDC-testnet payment to a
+destination address you choose, then has this platform independently
+verify the on-chain transaction before telling you it's paid - it never
+trusts the wallet's or the page's own claim. Wire it up with:
+
+  <div id="pay"></div>
+  <script src="payment-widget.js"></script>
+  <script>
+    mountPaymentWidget(document.getElementById('pay'), {
+      amountUsd: 5,
+      description: 'One month of premium',
+      destination: {
+        stellar: 'G...',  // ask the user for their own Stellar testnet address
+        evm: '0x...',     // ask the user for their own EVM address
+      },
+      onPaid(receipt) {
+        // receipt = { verified, chain, network, destination, asset,
+        //             amount_usd, tx_hash, receipt }
+        // Decide what "paid" unlocks on this page - there is no
+        // platform-side session or purchase record kept for you. If you
+        // want durable proof of payment, write `receipt` into this site's
+        // own document (see the guestbook/feed pattern below for how) -
+        // it's signed by the platform's own key, so it can't be forged by
+        // editing the page's client-side state.
+      },
+    });
+  </script>
+
+You MUST ask the user for their own receiving address(es) before wiring
+this in - `destination` is where THEIR money goes, this platform has no
+way to know it and must not guess or reuse an address seen elsewhere.
+Pass just `stellar`, just `evm`, or both; only the chain(s) you give a
+destination for are offered to the payer. Read `payment-widget.js` (via
+read_file) before customizing payment behavior - it's plain, commented JS,
+documenting exactly what it sends and expects back.
+
 Always resolve calls relative to the page's own current URL, never a
 hardcoded origin or absolute path - the site's eventual mount point (by
 name, by an opaque id, possibly behind a reverse-proxy prefix) isn't
@@ -165,10 +205,11 @@ namespace for its own entries:
 SYSTEM_PROMPT = (
     "You are building a small static website for a user, one file at a "
     "time, using the read_file and write_file tools. You may only read or "
-    "write these files: index.html, styles.css, client.js, chat-widget.js "
-    "- there is no other filesystem access. chat-widget.js is a ready-made, "
-    "already-styled chat component (see below) - read it before editing "
-    "it, and prefer using it as-is over writing chat UI from scratch. Keep "
+    "write these files: index.html, styles.css, client.js, chat-widget.js, "
+    "payment-widget.js - there is no other filesystem access. chat-widget.js "
+    "and payment-widget.js are ready-made, already-styled components (see "
+    "below) - read one before editing it, and prefer using it as-is over "
+    "writing chat or payment UI from scratch. Keep "
     "the site self-contained. Make small, "
     "incremental edits in response to each user request rather than "
     "rewriting everything each turn. When you believe the site satisfies "
