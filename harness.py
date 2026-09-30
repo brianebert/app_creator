@@ -255,9 +255,13 @@ SYSTEM_PROMPT = (
     "writing chat or payment UI from scratch. Keep "
     "the site self-contained. Make small, "
     "incremental edits in response to each user request rather than "
-    "rewriting everything each turn. When you believe the site satisfies "
-    "the user's request, say so in your reply, but do not publish it "
-    "yourself - only the user can do that."
+    "rewriting everything each turn. When you believe the site now "
+    "satisfies the user's request - not after every incremental edit, only "
+    "once the requested work is actually done - say so, and suggest the "
+    "user try the Preview buttons above this chat, give the app a name in "
+    "the box below the chat, and click Import to publish it. You cannot "
+    "preview, name, or publish the site yourself - only the user can do "
+    "that, using those controls."
     + CHASSIS_REFERENCE
 )
 
@@ -497,7 +501,9 @@ INDEX_PAGE = """<!doctype html>
   #log .user { color: #333; font-weight: 600; }
   #log .assistant { color: #0a5; }
   #status-bar { font-size: 12px; color: #666; margin-bottom: 4px; }
-  #nobody-says { font-size: 12px; color: #888; font-style: italic; min-height: 1.4em; margin-bottom: 8px; }
+  #nobody-says { font-size: 12px; color: #888; font-style: italic; max-height: 90px; overflow-y: auto; margin-bottom: 8px; border: 1px solid #eee; border-radius: 4px; padding: 4px 6px; box-sizing: border-box; }
+  #nobody-says div { margin-bottom: 2px; }
+  #nobody-says div:last-child { margin-bottom: 0; }
   #toast { font-size: 12px; background: #fff3cd; border: 1px solid #e0c46c; border-radius: 4px; padding: 6px 10px; margin-bottom: 8px; display: none; }
   textarea { width: 100%; box-sizing: border-box; }
   #preview-buttons { display: flex; gap: 8px; margin-top: 6px; }
@@ -569,6 +575,33 @@ function nobodySaying(activity) {
   const variants = NOBODY_SAYINGS[activity.phase] || NOBODY_SAYINGS.thinking;
   const template = variants[Math.floor(Math.random() * variants.length)];
   return template.replace('{path}', activity.path || '');
+}
+
+// #nobody-says is an append-only, scrolling log for the whole session - lines
+// are never cleared or overwritten, only added to, so a user can scroll back
+// through everything Nobody has said so far. Keyed by activity identity
+// (phase+path, or phase+the model's own status text) rather than by the
+// rendered string, so the *canned* phases (whose wording is picked at random
+// each poll) don't spam a new line every 1.2s while nothing has actually
+// changed - a new line only appears when the underlying activity itself
+// changes.
+let lastActivityKey = null;
+
+function activityKey(activity) {
+  if (!activity) return null;
+  return activity.phase === 'status'
+    ? 'status:' + activity.text
+    : 'phase:' + activity.phase + ':' + (activity.path || '');
+}
+
+function appendNobodyLine(activity) {
+  const key = activityKey(activity);
+  if (!key || key === lastActivityKey) return;
+  lastActivityKey = key;
+  const line = document.createElement('div');
+  line.textContent = nobodySaying(activity);
+  nobodySaysEl.appendChild(line);
+  nobodySaysEl.scrollTop = nobodySaysEl.scrollHeight;
 }
 
 // Budget/time reminders: no persistent dollar figure or countdown shown at
@@ -687,7 +720,7 @@ async function pollActivity() {
   try {
     const r = await fetch('/status');
     const j = await r.json();
-    nobodySaysEl.textContent = nobodySaying(j.activity);
+    appendNobodyLine(j.activity);
   } catch (err) {
     // A transient failure here just means one blank tick - not worth
     // interrupting the chat request itself over.
@@ -700,7 +733,7 @@ async function send() {
   addMsg('user', message);
   input.value = '';
   sendBtn.disabled = true;
-  nobodySaysEl.textContent = nobodySaying({phase: 'thinking'});
+  appendNobodyLine({phase: 'thinking'});
   const activityTimer = setInterval(pollActivity, 1200);
   try {
     const r = await fetch('/chat', {
@@ -722,7 +755,6 @@ async function send() {
     }
   } finally {
     clearInterval(activityTimer);
-    nobodySaysEl.textContent = '';
     await refreshStatus();
   }
 }
