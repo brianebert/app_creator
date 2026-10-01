@@ -842,16 +842,6 @@ class Handler(BaseHTTPRequestHandler):
             # _time_remaining_pct() takes _lock itself - computed before
             # entering this block, since Lock isn't reentrant.
             time_remaining_pct = _time_remaining_pct()
-            # Diagnostic only, read fresh (not cached/module-level) to check
-            # whether this memory-snapshot template's restored kernel reports
-            # real per-session uptime or something inherited from build time
-            # - the same class of trap SESSION_START hit, but for the kernel
-            # rather than Python's own frozen process memory. Remove once
-            # answered.
-            try:
-                proc_uptime_secs = float(Path("/proc/uptime").read_text().split()[0])
-            except Exception:
-                proc_uptime_secs = None
             with _lock:
                 self._send_json(
                     {
@@ -861,8 +851,6 @@ class Handler(BaseHTTPRequestHandler):
                         "name": _state["name"],
                         "activity": _state["activity"],
                         "time_remaining_pct": time_remaining_pct,
-                        "wall_clock": time.time(),
-                        "proc_uptime_secs": proc_uptime_secs,
                     }
                 )
         elif path == "/export":
