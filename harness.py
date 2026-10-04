@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -52,6 +53,20 @@ CACHE_WRITE_5M_MULTIPLIER = 1.25
 CACHE_WRITE_1H_MULTIPLIER = 2.00
 CACHE_READ_MULTIPLIER = 0.10
 
+# Bounds one *batch* - roughly, how long a single /chat HTTP request can run
+# before returning - NOT a cap on the whole build. A build that needs more
+# tool calls than this just continues in a background thread after this
+# batch returns (see _continue_in_background) until the model is genuinely
+# done or BUDGET_USD is exhausted, either of which is checked after every
+# single model call regardless of batch boundaries and is the real backstop
+# against runaway cost. Originally this WAS the only limit on a whole build,
+# with nothing to resume a session that needed more than this many steps -
+# confirmed live 2026-10-04 that a session which needed more tool calls than
+# this to finish a one-shot build (the same kind of request "fun"/"bun"/
+# "buns" handled fine, just needing more file read/write steps) hit this
+# cap, returned, and then sat at status="building" forever: nothing but a
+# human typing into the chat box ever called /chat, and chassis's own
+# session loop only ever polls /status - it never drives the conversation.
 MAX_TOOL_ITERATIONS = 8
 
 # Real, working reference patterns for the platform that will eventually
@@ -310,6 +325,18 @@ _state = {
     # the page's own fast interval during a turn to show a "Nobody says..."
     # line - see NOBODY_SAYINGS in INDEX_PAGE.
     "activity": None,
+    # True while _drive_until_stopped is actively running, whether that's
+    # the human-triggered call itself or a background continuation it
+    # handed off to (see MAX_TOOL_ITERATIONS below) - True for longer than
+    # any single /chat HTTP request runs, which is the whole point: a build
+    # that needs more than one batch keeps going on its own without a human
+    # needing to send another message, and the page must not let a second
+    # /chat call start (and silently corrupt the shared conversation state)
+    # while that's happening. Exposed via /status so the page can keep
+    # Send/Import disabled and keep showing live narration for exactly as
+    # long as real work is actually happening - not just for the duration
+    # of its own fetch.
+    "driving": False,
     # Wall-clock time of this session's first real request - deliberately
     # NOT set here at module level. The active Tenki template is a
     # memory-snapshot one: this whole module only ever actually executes
@@ -390,17 +417,15 @@ def _run_tool(name: str, tool_input: dict) -> str:
     raise ValueError(f"unknown tool: {name}")
 
 
-def run_chat_turn(user_message: str) -> dict:
-    if client is None:
-        return {"error": "no_api_key", "cost_usd": 0.0}
-    with _lock:
-        if _state["status"] != "building":
-            return {"error": _state["status"], "cost_usd": _state["cost_usd"]}
-        _state["messages"].append(
-            {"role": "user", "content": user_message + TASK_STATUS_INSTRUCTIONS}
-        )
-        messages = list(_state["messages"])
-
+def _drive_until_stopped(messages: list) -> tuple[str, bool]:
+    """Runs model+tool turns, mutating `messages` in place, until one of
+    three things happens: the model is genuinely done (stop_reason is no
+    longer "tool_use"), the budget runs out, or this batch's own
+    MAX_TOOL_ITERATIONS cap is hit. Returns (final_text, hit_cap) - hit_cap
+    is True only in the last case, so the caller can tell "stopped because
+    there's nothing more to do" from "stopped because this batch ran out of
+    room, there's still more work queued up."
+    """
     final_text = ""
     budget_exhausted = False
     # The model's own narration of its current subtask (see
@@ -409,86 +434,162 @@ def run_chat_turn(user_message: str) -> dict:
     # (near-instant) tool-execution gap and the next, possibly slow,
     # generation, until replaced by newer narration.
     last_status_text = None
-    try:
-        for _ in range(MAX_TOOL_ITERATIONS):
+    for _ in range(MAX_TOOL_ITERATIONS):
+        with _lock:
+            _state["activity"] = (
+                {"phase": "status", "text": last_status_text}
+                if last_status_text
+                else {"phase": "thinking"}
+            )
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            # Cached: SYSTEM_PROMPT is identical on every turn of a session
+            # and grew substantially once CHASSIS_REFERENCE was added - the
+            # cost formula below already accounted for cache pricing, this
+            # is what actually turns it on.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            messages=messages,
+            tools=TOOLS,
+        )
+
+        with _lock:
+            _state["cost_usd"] += _turn_cost_usd(response.usage)
+            budget_exhausted = _state["cost_usd"] >= BUDGET_USD
+            if budget_exhausted:
+                _state["status"] = "budget_exhausted"
+
+        assistant_content = [block.model_dump() for block in response.content]
+        messages.append({"role": "assistant", "content": assistant_content})
+        final_text = "\n".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+        if budget_exhausted or response.stop_reason != "tool_use":
+            return final_text, False
+
+        status_text = final_text.strip()
+        if status_text:
+            last_status_text = status_text
+            with _lock:
+                _state["activity"] = {"phase": "status", "text": last_status_text}
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
             with _lock:
                 _state["activity"] = (
                     {"phase": "status", "text": last_status_text}
                     if last_status_text
-                    else {"phase": "thinking"}
+                    else {"phase": block.name, "path": block.input.get("path")}
                 )
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                # Cached: SYSTEM_PROMPT is identical on every turn of a session
-                # and grew substantially once CHASSIS_REFERENCE was added - the
-                # cost formula below already accounted for cache pricing, this
-                # is what actually turns it on.
-                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-                messages=messages,
-                tools=TOOLS,
-            )
+            try:
+                result = _run_tool(block.name, block.input)
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                )
+            except Exception as exc:
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(exc),
+                        "is_error": True,
+                    }
+                )
+        messages.append({"role": "user", "content": tool_results})
+    # Loop exhausted MAX_TOOL_ITERATIONS while the model still wanted to use
+    # tools (every early return above covers the other two outcomes) - this
+    # batch is done, but the build isn't.
+    return final_text, True
 
+
+def _continue_in_background(messages: list) -> None:
+    """Keeps calling _drive_until_stopped with the same, already-in-progress
+    `messages` list - no new user message needed, the model's own next turn
+    already follows directly from where the last batch's tool_results left
+    off - until the build is actually done or the budget runs out. This is
+    what makes a build that needs more than one batch finish on its own:
+    nothing here depends on a human sending another /chat message, unlike
+    the plain per-request loop this replaced.
+    """
+    try:
+        hit_cap = True
+        while hit_cap:
             with _lock:
-                _state["cost_usd"] += _turn_cost_usd(response.usage)
-                budget_exhausted = _state["cost_usd"] >= BUDGET_USD
-                if budget_exhausted:
-                    _state["status"] = "budget_exhausted"
-
-            assistant_content = [block.model_dump() for block in response.content]
-            messages.append({"role": "assistant", "content": assistant_content})
-            final_text = "\n".join(
-                block.text for block in response.content if block.type == "text"
-            )
-
-            if budget_exhausted or response.stop_reason != "tool_use":
-                break
-
-            status_text = final_text.strip()
-            if status_text:
-                last_status_text = status_text
-                with _lock:
-                    _state["activity"] = {"phase": "status", "text": last_status_text}
-
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                with _lock:
-                    _state["activity"] = (
-                        {"phase": "status", "text": last_status_text}
-                        if last_status_text
-                        else {"phase": block.name, "path": block.input.get("path")}
-                    )
-                try:
-                    result = _run_tool(block.name, block.input)
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                    )
-                except Exception as exc:
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(exc),
-                            "is_error": True,
-                        }
-                    )
-            messages.append({"role": "user", "content": tool_results})
+                if _state["status"] != "building":
+                    return
+            try:
+                _, hit_cap = _drive_until_stopped(messages)
+            except Exception:
+                # A batch failing here (e.g. a transient API error) must not
+                # leave driving=True forever - see the comment on the
+                # "driving" state field: that would wedge Send/Import
+                # disabled permanently with no human turn able to recover
+                # it. Logged, not re-raised - there's no HTTP response left
+                # to report it to.
+                traceback.print_exc()
+                return
+            with _lock:
+                _state["messages"] = messages
     finally:
-        # Always cleared, even if client.messages.create raised - otherwise
-        # a failed turn would leave a stale "Nobody is ..." line showing
-        # forever, since nothing else would ever set activity back to None.
         with _lock:
             _state["activity"] = None
+            _state["driving"] = False
+
+
+def run_chat_turn(user_message: str) -> dict:
+    if client is None:
+        return {"error": "no_api_key", "cost_usd": 0.0}
+    with _lock:
+        if _state["status"] != "building":
+            return {"error": _state["status"], "cost_usd": _state["cost_usd"]}
+        if _state["driving"]:
+            # A background continuation (or, in principle, an overlapping
+            # request) is already driving this same conversation - starting
+            # a second one here would have both threads appending to the
+            # same `messages` list and racing against the same Anthropic
+            # conversation state. The page keeps Send disabled the whole
+            # time driving=True specifically to make this unreachable in
+            # normal use; this is the defensive backstop, not the intended
+            # path.
+            return {"error": "busy", "cost_usd": _state["cost_usd"]}
+        _state["driving"] = True
+        _state["messages"].append(
+            {"role": "user", "content": user_message + TASK_STATUS_INSTRUCTIONS}
+        )
+        messages = list(_state["messages"])
+
+    try:
+        final_text, hit_cap = _drive_until_stopped(messages)
+    except Exception:
+        with _lock:
+            _state["activity"] = None
+            _state["driving"] = False
+        raise
+    with _lock:
+        _state["messages"] = messages
+
+    if hit_cap:
+        # Still more work queued up - keep going without waiting for a
+        # human to send another message (see _continue_in_background's own
+        # docstring for why this is the actual fix, not just a bigger
+        # MAX_TOOL_ITERATIONS). driving stays True; the background thread
+        # clears it once the build is genuinely done or out of budget.
+        threading.Thread(target=_continue_in_background, args=(messages,), daemon=True).start()
+    else:
+        with _lock:
+            _state["activity"] = None
+            _state["driving"] = False
 
     # _time_remaining_pct() takes _lock itself - computed before entering
     # the block below, since Lock isn't reentrant.
     time_remaining_pct = _time_remaining_pct()
     with _lock:
-        _state["messages"] = messages
         return {
             "reply": final_text,
+            "continuing": hit_cap,
             "status": _state["status"],
             "cost_usd": _state["cost_usd"],
             "budget_usd": BUDGET_USD,
@@ -712,7 +813,13 @@ async function refreshStatus() {
   const j = await r.json();
   statusEl.textContent = j.status;
   checkThresholds(j.cost_usd, j.budget_usd, j.time_remaining_pct);
-  const disabled = j.status !== 'building';
+  // driving stays true for as long as a build is genuinely still working -
+  // including a background continuation that outlives the /chat request
+  // that started it (see MAX_TOOL_ITERATIONS in harness.py) - so Send/
+  // Import must stay disabled for that whole stretch, not just while this
+  // page's own fetch is in flight, or a second /chat call here could race
+  // the background one and corrupt the shared conversation state.
+  const disabled = j.status !== 'building' || j.driving;
   input.disabled = disabled;
   sendBtn.disabled = disabled;
   publishBtn.disabled = disabled;
@@ -721,14 +828,24 @@ async function refreshStatus() {
   return j;
 }
 
-// Polls /status quickly while a /chat turn is in flight, purely to render
+// Polls /status quickly while real work is happening, to render
 // NOBODY_SAYINGS from the backend's current activity - independent of, and
-// much faster than, the 5s refreshStatus() interval below.
+// much faster than, the 5s refreshStatus() interval below. Self-terminating
+// on driving=false (not just cleared once this page's own /chat fetch
+// resolves) - a build can keep working in the background past that point
+// (see MAX_TOOL_ITERATIONS in harness.py), and without this the narration
+// would go silent exactly while that's happening, which is indistinguishable
+// from actually being stuck.
+let activityTimer = null;
 async function pollActivity() {
   try {
     const r = await fetch('/status');
     const j = await r.json();
     appendNobodyLine(j.activity);
+    if (!j.driving && activityTimer) {
+      clearInterval(activityTimer);
+      activityTimer = null;
+    }
   } catch (err) {
     // A transient failure here just means one blank tick - not worth
     // interrupting the chat request itself over.
@@ -742,7 +859,7 @@ async function send() {
   input.value = '';
   sendBtn.disabled = true;
   appendNobodyLine({phase: 'thinking'});
-  const activityTimer = setInterval(pollActivity, 1200);
+  if (!activityTimer) activityTimer = setInterval(pollActivity, 1200);
   try {
     const r = await fetch('/chat', {
       method: 'POST',
@@ -753,7 +870,12 @@ async function send() {
     if (j.error) {
       addMsg('assistant', 'Error: ' + j.error);
     } else {
-      addMsg('assistant', j.reply || '(no reply)');
+      // continuing=true with an empty reply means this batch ended on a
+      // tool call, mid-build, with nothing worth showing as a reply yet -
+      // a "(no reply)" bubble there would read as if the model had nothing
+      // to say, when it's actually still working (see pollActivity for how
+      // that ongoing work keeps showing up instead).
+      if (j.reply || !j.continuing) addMsg('assistant', j.reply || '(no reply)');
       // Checked right here, off this response's own numbers, rather than
       // waiting for the next poll - tokens only actually change when the
       // model has just returned with something, so this is the real event
@@ -762,7 +884,9 @@ async function send() {
       refreshPreview();
     }
   } finally {
-    clearInterval(activityTimer);
+    // activityTimer is deliberately left running here when the build is
+    // still continuing in the background - pollActivity clears it itself
+    // once a poll reports driving=false, not when this one fetch resolves.
     await refreshStatus();
   }
 }
@@ -858,6 +982,7 @@ class Handler(BaseHTTPRequestHandler):
                         "budget_usd": BUDGET_USD,
                         "name": _state["name"],
                         "activity": _state["activity"],
+                        "driving": _state["driving"],
                         "time_remaining_pct": time_remaining_pct,
                     }
                 )
