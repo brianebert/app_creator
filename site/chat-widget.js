@@ -33,15 +33,18 @@
 //    app whose own document predates this feature (or was created some
 //    other way) falls back to the old behavior: mints its own throwaway
 //    document, private to this one page, the first time anyone sends a
-//    message.
+//    message. Once this app is published, the platform reuses this exact
+//    document as its chat.js-visible topic too (same `request_chat_topic_
+//    registration`, now reusing `chat.private-topic` instead of minting a
+//    second, disconnected document) - so this default conversation and the
+//    one visible in chat.js end up being the same one, automatically.
 //
-// 2. Join an existing topic - pass `namespace` AND `writeTicket` for a
-//    topic that already exists (for example, one the user created earlier
-//    through the standalone chat app's own "New Topic" button, or one
-//    registered in chat's own `topics/` directory after this app was
-//    published - see request_chat_topic_registration). This makes the
-//    widget show and post into that exact same live conversation - useful
-//    when the user wants this page and the chat app to share one thread.
+// 2. Join a DIFFERENT existing topic - pass `namespace` AND `writeTicket`
+//    for a topic that already exists elsewhere (for example, one the user
+//    made through the standalone chat app's own "New Topic" button, for a
+//    cross-site shared thread unrelated to this app's own conversation).
+//    This makes the widget show and post into that exact same live
+//    conversation instead of this app's own default one.
 function mountChatTopic(container, options) {
   options = options || {};
   const topicName = options.topicName || 'chat';
