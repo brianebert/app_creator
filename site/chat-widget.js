@@ -17,23 +17,31 @@
 //
 // Two modes, chosen by what you pass:
 //
-// 1. Private feed (default - just pass topicName, nothing else). Mints a
-//    brand-new document of its own the first time anyone sends a message,
-//    scoped to this app - a guestbook, comment thread, or single chat room
-//    that lives only on this site. This is the only mode a generated app
-//    can use on its own; it needs no ticket and no setup step.
+// 1. Private feed (default - just pass topicName, nothing else). Every copy
+//    of this exact imported app shares one private chat automatically - no
+//    setup, no ticket, and it isn't tied to chat.js or any particular
+//    sidecar. This works because chassis mints a dedicated chat-topic
+//    document for every generated app at creation time and records a
+//    {namespace, secret} pointer under a self-declared `chat.private-topic`
+//    key on the app's own document (see PRIVATE_CHAT_TOPIC_KEY/
+//    mint_private_chat_topic in chassis's main.rs) - since every copy of one
+//    *imported* app is the same synced document, this key (and so this
+//    conversation) is the same everywhere that app ends up, with no publish
+//    step required. `ensureTopic()` below reads that key and joins the
+//    pointed-to topic via chassis's `/doc?secret=...` (no ticket, no stored
+//    node address - see that endpoint's own doc comment for why). Only an
+//    app whose own document predates this feature (or was created some
+//    other way) falls back to the old behavior: mints its own throwaway
+//    document, private to this one page, the first time anyone sends a
+//    message.
 //
 // 2. Join an existing topic - pass `namespace` AND `writeTicket` for a
 //    topic that already exists (for example, one the user created earlier
-//    through the standalone chat app's own "New Topic" button). This makes
-//    the widget show and post into that exact same live conversation -
-//    useful when the user wants this page and the chat app to share one
-//    thread. A generated app cannot mint a *new* topic that chat.js itself
-//    will also discover (that requires a write ticket to chat's own
-//    document, which this platform does not hand out to generated apps) -
-//    if the user wants that, they need to create the topic in the chat app
-//    first and give you its namespace/ticket (visible via that topic's own
-//    share/ticket action), then pass them here.
+//    through the standalone chat app's own "New Topic" button, or one
+//    registered in chat's own `topics/` directory after this app was
+//    published - see request_chat_topic_registration). This makes the
+//    widget show and post into that exact same live conversation - useful
+//    when the user wants this page and the chat app to share one thread.
 function mountChatTopic(container, options) {
   options = options || {};
   const topicName = options.topicName || 'chat';
@@ -59,6 +67,25 @@ function mountChatTopic(container, options) {
 
   function absoluteUrl(path) {
     return new URL(`${pathPrefix()}/${path}`, window.location.origin).toString();
+  }
+
+  // Unlike pathPrefix() above (which deliberately drops this page's own
+  // mount segment to reach the *sidecar's* root, for calls like minting an
+  // unrelated document or reading sidecar-wide stats), this keeps it - it's
+  // for reading a key out of *this app's own* document. Safe only because
+  // every app this harness builds is single-page (same assumption
+  // pathPrefix() already documents): the current path, minus a trailing
+  // `index.html` filename or trailing slash, is just this app's own mount
+  // root either way it was reached (`/<name>/` or `/documents/<hash>/`).
+  function ownAppPrefix() {
+    let path = window.location.pathname;
+    if (path.endsWith('/index.html')) path = path.slice(0, -'index.html'.length);
+    if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    return path === '/' ? '' : path;
+  }
+
+  function ownAppUrl(path) {
+    return new URL(`${ownAppPrefix()}/${path}`, window.location.origin).toString();
   }
 
   async function fetchJson(url, opts) {
@@ -102,12 +129,42 @@ function mountChatTopic(container, options) {
     mySidecarEndpointId = stats.endpoint_id;
   }
 
-  // Mints a private, single-purpose document the first time this page
-  // actually needs one - same primitive as the standalone-feed pattern
-  // (a bare POST /doc with no ticket creates a new document). Idempotent:
-  // once `namespace` is set, later calls are a no-op.
+  // Reads this app's own `chat.private-topic` pointer (if any) and joins it
+  // via chassis's secret-only /doc join, no ticket involved - see the mode-1
+  // doc comment above. Read-only and cheap when the key is absent (just one
+  // GET against this app's own document), so it's safe to call eagerly at
+  // page load, before anyone has sent a message - unlike ensureTopic()'s
+  // fallback mint below, this never creates anything of its own. Returns
+  // whether a topic was actually joined.
+  async function tryJoinPrivateChatTopic() {
+    if (namespace) return true;
+    try {
+      const entries = await fetchJson(ownAppUrl('doc?prefix=chat.private-topic&inline=1'));
+      const entry = entries[0];
+      if (!entry || !entry.content) return false;
+      const pointer = JSON.parse(entry.content);
+      const params = new URLSearchParams({
+        secret: pointer.secret,
+        name: 'private-chat',
+        listed: '0',
+      });
+      const joined = await fetchJson(absoluteUrl(`doc?${params}`), { method: 'POST' });
+      namespace = joined.namespace;
+      writeTicket = joined.write_ticket;
+      return true;
+    } catch (error) {
+      console.error('private chat-topic lookup failed, falling back to a page-local topic', error);
+      return false;
+    }
+  }
+
+  // Joins this app's shared private topic if it has one; otherwise mints an
+  // isolated, page-local document the first time this page actually needs
+  // one (the old behavior) - only reached for an app whose own document
+  // predates this feature. Idempotent either way: once `namespace` is set,
+  // later calls are a no-op.
   async function ensureTopic() {
-    if (namespace) return;
+    if (await tryJoinPrivateChatTopic()) return;
     const params = new URLSearchParams({ name: topicName, listed: '0' });
     const created = await fetchJson(absoluteUrl(`doc?${params}`), { method: 'POST' });
     namespace = created.namespace;
@@ -246,7 +303,13 @@ function mountChatTopic(container, options) {
   // wedge in "unavailable" for the rest of the page's life with no way to
   // self-heal once the underlying issue clears.
   fetchMyEndpointId().catch((error) => console.error('fetch own endpoint id failed', error));
-  (namespace ? joinExistingTopic() : Promise.resolve())
+  // Eager, read-only attempt at page load (not just lazily on first send):
+  // a shared topic is pointless if other visitors' messages stay invisible
+  // until you post one yourself. Safe for the old per-page-mint fallback
+  // too - tryJoinPrivateChatTopic() never mints anything on its own, so an
+  // app without a chat.private-topic key just resolves to false here and
+  // loadMessages() below no-ops until sendMessage() eventually mints one.
+  (namespace ? joinExistingTopic() : tryJoinPrivateChatTopic())
     .then(loadMessages)
     .catch((error) => console.error('initial load failed', error));
   startPolling();

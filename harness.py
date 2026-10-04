@@ -91,21 +91,30 @@ platform rather than a bespoke reskin. Wire it up with:
     mountChatTopic(document.getElementById('chat'), {topicName: 'general'});
   </script>
 
-By default it mints its own private feed the first time someone sends a
-message - no setup step, no ticket, same underlying mechanism as the
-guestbook/feed pattern below, just pre-styled and pre-wired. Only fall back
-to the raw patterns further below if the user wants something chat-widget.js
-doesn't cover (a non-chat feed/guestbook with custom fields, or a fully
-custom visual style the user explicitly asked for instead of the platform's
-own look).
+By default it joins a private conversation the platform already set up for
+this exact site - no setup step, no ticket, and every visitor across every
+copy of this imported site sees and posts into the same conversation
+automatically, because it's tied to the site's own document rather than to
+one page load. It is NOT visible in the platform's own standalone chat app,
+and nobody needs to create anything for it to work - it just works the
+moment the site is imported. Only fall back to the raw patterns further
+below if the user wants something chat-widget.js doesn't cover (a non-chat
+feed/guestbook with custom fields, or a fully custom visual style the user
+explicitly asked for instead of the platform's own look).
 
-If the user wants THIS widget to share one live conversation with the
-platform's own standalone chat app (visible and postable from both
-places), pass `namespace` and `writeTicket` for a topic the user already
-created there through its own "New Topic" button, and gave you the ticket
-for (visible via that topic's own share/ticket action). Generated code has
-no way to mint a topic the chat app will also discover on its own - only a
-topic the user creates in the chat app first can be shared this way:
+Separately, once the user actually publishes this site (via the Import
+button's own later Publish step, not something you or this preview can
+trigger), the platform automatically registers a topic for it in its own
+standalone chat app too - with no code or setup from you. That is a
+DIFFERENT conversation from the widget's own default one above, visible and
+joinable from the chat app itself by anyone, but the widget on this page
+won't show it unless explicitly pointed at it.
+
+If the user wants THIS widget to show and post into that same
+chat-app-visible conversation (or any other topic that already exists in
+the chat app - e.g. one made through its own "New Topic" button), pass
+`namespace` and `writeTicket` for it, which the user can get from that
+topic's own share/ticket action inside the chat app once it exists there:
 
   mountChatTopic(document.getElementById('chat'), {
     topicName: 'general',
