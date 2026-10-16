@@ -179,6 +179,16 @@ destination for are offered to the payer. Read `payment-widget.js` (via
 read_file) before customizing payment behavior - it's plain, commented JS,
 documenting exactly what it sends and expects back.
 
+The platform verifies that a real payment reached `destination` - it does
+NOT verify that `destination` belongs to this site or its builder. Nothing
+server-side binds a payment destination to a specific app's identity, so a
+copied or modified version of this site's code could point payments at a
+different address and still "verify" successfully, since as far as the
+platform is concerned that's just a different, equally valid payment. This
+is a real, currently-unfixed limitation of the platform itself, not
+something fixable from this site's own code - mention it to the user if
+they're relying on this for anything where that distinction matters.
+
 Always resolve calls relative to the page's own current URL, never a
 hardcoded origin or absolute path - the site's eventual mount point (by
 name, by an opaque id, possibly behind a reverse-proxy prefix) isn't
