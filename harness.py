@@ -143,21 +143,16 @@ in its own header comment.
 For a PAYMENT feature - charging a real price in crypto for something on
 this site - a ready-made component is likewise always present:
 `payment-widget.js`. It drives the wallet (Freighter for Stellar, MetaMask
-for Ethereum/Polygon) to build and sign a real USDC-testnet payment to a
-destination address you choose, then has this platform independently
-verify the on-chain transaction before telling you it's paid - it never
-trusts the wallet's or the page's own claim. Wire it up with:
+for Ethereum/Polygon) to build and sign a real USDC-testnet payment, then
+has this platform independently verify the on-chain transaction before
+telling you it's paid - it never trusts the wallet's or the page's own
+claim. Wire it up with:
 
   <div id="pay"></div>
   <script src="payment-widget.js"></script>
   <script>
     mountPaymentWidget(document.getElementById('pay'), {
-      amountUsd: 5,
-      description: 'One month of premium',
-      destination: {
-        stellar: 'G...',  // ask the user for their own Stellar testnet address
-        evm: '0x...',     // ask the user for their own EVM address
-      },
+      itemId: 'premium',  // matches a pricing/premium entry - see below
       onPaid(receipt) {
         // receipt = { verified, chain, network, destination, asset,
         //             amount_usd, tx_hash, receipt }
@@ -171,23 +166,34 @@ trusts the wallet's or the page's own claim. Wire it up with:
     });
   </script>
 
-You MUST ask the user for their own receiving address(es) before wiring
-this in - `destination` is where THEIR money goes, this platform has no
-way to know it and must not guess or reuse an address seen elsewhere.
-Pass just `stellar`, just `evm`, or both; only the chain(s) you give a
-destination for are offered to the payer. Read `payment-widget.js` (via
+Price and destination are deliberately NOT options you pass here - they
+live in a `pricing/<itemId>` doc entry on this site's own document, which
+is the one place the platform itself trusts for what an item costs and
+where it's paid (this is what stops a copied page from quietly redirecting
+payments: changing the price or address requires write access to the real
+app's own namespace, which a copy doesn't have). Concretely, for each
+`itemId` you use, `pricing/<itemId>` must hold:
+  {"amount_usd": 5, "description": "One month of premium",
+   "destination": {"stellar": "G...", "evm": "0x..."}}
+(pass just `stellar`, just `evm`, or both - only the chain(s) given are
+offered to the payer).
+
+You (the model) have no network access during this session - you cannot
+write that entry yourself, the same way you cannot ask the platform
+anything else requiring a live API call. You MUST ask the user for both
+their own receiving address(es) (never guess or reuse one seen elsewhere)
+and have them set `pricing/<itemId>` themselves, e.g.:
+
+  curl -s -X POST '<their site's own URL>/blob' --data-binary \
+    '{"amount_usd": 5, "description": "...", "destination": {"stellar": "G..."}}'
+  # then, using the returned {hash, size}:
+  curl -X POST '<their site's own URL>/doc/pricing/premium' \
+    -H 'Content-Type: application/json' -d '{"hash": "...", "size": ...}'
+
+Tell them plainly that the payment button won't work until they've done
+this for every `itemId` the page uses. Read `payment-widget.js` (via
 read_file) before customizing payment behavior - it's plain, commented JS,
 documenting exactly what it sends and expects back.
-
-The platform verifies that a real payment reached `destination` - it does
-NOT verify that `destination` belongs to this site or its builder. Nothing
-server-side binds a payment destination to a specific app's identity, so a
-copied or modified version of this site's code could point payments at a
-different address and still "verify" successfully, since as far as the
-platform is concerned that's just a different, equally valid payment. This
-is a real, currently-unfixed limitation of the platform itself, not
-something fixable from this site's own code - mention it to the user if
-they're relying on this for anything where that distinction matters.
 
 Always resolve calls relative to the page's own current URL, never a
 hardcoded origin or absolute path - the site's eventual mount point (by

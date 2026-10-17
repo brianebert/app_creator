@@ -6,19 +6,26 @@
 // before telling this widget the payment is good - it never trusts the
 // wallet's or this page's own claim.
 //
+// Price and destination are NOT passed here as options - they live on the
+// app's own document at pricing/<itemId> (the one place chassis itself
+// trusts for what an item costs and where it's paid; see
+// read_pricing_entry/[[project_payment_destination_spoofing_todo]] for why
+// a client-supplied destination was never safe to verify against). Set it
+// once via the same generic blob+doc primitives used for topics.watch:
+//
+//   HASH=$(curl -s -X POST "$HOST/<app>/blob" --data-binary \
+//     '{"amount_usd": 5, "description": "One month of premium", \
+//       "destination": {"stellar": "G...", "evm": "0x..."}}' | jq -r .hash)
+//   curl -X POST "$HOST/<app>/doc/pricing/premium" \
+//     -H "Content-Type: application/json" -d "{\"hash\":\"$HASH\",\"size\":...}"
+//
 // Usage - add one container element and one script tag to index.html:
 //
 //   <div id="pay"></div>
 //   <script src="payment-widget.js"></script>
 //   <script>
 //     mountPaymentWidget(document.getElementById('pay'), {
-//       amountUsd: 5,
-//       description: 'One month of premium',
-//       destination: {
-//         stellar: 'G...',      // your own Stellar testnet address
-//         evm: '0x...',         // your own EVM address (works on every
-//                                // supported EVM network - Sepolia, Amoy)
-//       },
+//       itemId: 'premium',   // matches pricing/premium on this app's doc
 //       onPaid(receipt) {
 //         // receipt = { verified, chain, network, destination, asset,
 //         //             amount_usd, tx_hash, receipt }
@@ -33,26 +40,22 @@
 //     });
 //   </script>
 //
-// Only the chains you pass a `destination` for are offered - pass just
-// `stellar`, just `evm`, or both. Every network this sidecar knows about
-// is fetched live from `GET /payment/networks` (the same data-driven
-// pattern /create-app's own page uses), so a new network or token shows up
-// automatically without any change here.
+// Only the chains pricing/<itemId>'s own destination covers are offered.
+// Every network this sidecar knows about is fetched live from
+// `GET /payment/networks` (the same data-driven pattern /create-app's own
+// page uses), so a new network or token shows up automatically without any
+// change here.
 //
 // Testnet only, same as /create-app - real receiving addresses, fake
 // money. Users pay their own network fee; there is no fee sponsorship yet.
 function mountPaymentWidget(container, options) {
   options = options || {};
-  const amountUsd = options.amountUsd;
-  const destinations = options.destination || {};
-  const description = options.description || '';
+  const itemId = options.itemId;
   const onPaid = typeof options.onPaid === 'function' ? options.onPaid : () => {};
-  if (!amountUsd || amountUsd <= 0) {
-    throw new Error('mountPaymentWidget requires a positive options.amountUsd');
+  if (!itemId) {
+    throw new Error('mountPaymentWidget requires options.itemId (matching a pricing/<itemId> doc entry)');
   }
-  if (!destinations.stellar && !destinations.evm) {
-    throw new Error('mountPaymentWidget requires options.destination.stellar and/or .evm');
-  }
+  let amountUsd, destinations, description;
 
   injectStylesOnce();
 
@@ -78,15 +81,13 @@ function mountPaymentWidget(container, options) {
   }
 
   container.innerHTML =
-    (description ? `<p class="payment-widget-description"></p>` : '') +
+    '<p class="payment-widget-description" hidden></p>' +
     '<label class="payment-widget-label">Pay with</label>' +
     '<select class="payment-widget-network"></select>' +
     '<select class="payment-widget-token"></select>' +
     '<p><button type="button" class="payment-widget-button" disabled>Loading payment options...</button></p>' +
     '<p class="payment-widget-status"></p>';
-  if (description) {
-    container.querySelector('.payment-widget-description').textContent = description;
-  }
+  const descriptionEl = container.querySelector('.payment-widget-description');
   const networkSelect = container.querySelector('.payment-widget-network');
   const tokenSelect = container.querySelector('.payment-widget-token');
   const payButton = container.querySelector('.payment-widget-button');
@@ -117,10 +118,25 @@ function mountPaymentWidget(container, options) {
 
   (async () => {
     try {
+      const key = 'pricing/' + itemId;
+      const entries = await fetchJson(absoluteUrl(`doc?prefix=${encodeURIComponent(key)}&inline=1`));
+      const entry = entries.find((e) => e.key === key);
+      if (!entry || !entry.content) {
+        throw new Error(`no pricing/${itemId} entry found on this app's own document`);
+      }
+      const pricing = JSON.parse(entry.content);
+      amountUsd = pricing.amount_usd;
+      destinations = pricing.destination || {};
+      description = pricing.description || '';
+      if (description) {
+        descriptionEl.hidden = false;
+        descriptionEl.textContent = description;
+      }
+
       const all = await fetchJson(absoluteUrl('payment/networks'));
       networks = all.networks.filter((n) => Boolean(destinationFor(n)));
       if (networks.length === 0) {
-        throw new Error('no supported chain matches the destination(s) given to mountPaymentWidget');
+        throw new Error(`pricing/${itemId}'s destination has no chain this sidecar supports`);
       }
       networkSelect.innerHTML = '';
       for (const network of networks) {
@@ -185,7 +201,7 @@ function mountPaymentWidget(container, options) {
     if (signed.error) throw new Error(signed.error.message || String(signed.error));
 
     setStatus('Submitting payment...');
-    return fetchJson(absoluteUrl('payment/verify/stellar'), {
+    return fetchJson(absoluteUrl(`payment/verify/stellar/${encodeURIComponent(itemId)}`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ xdr: signed.signedTxXdr, destination, min_amount: amountUsd }),
@@ -226,7 +242,7 @@ function mountPaymentWidget(container, options) {
     });
 
     setStatus('Waiting for the transaction to be mined - this can take a minute...');
-    return fetchJson(absoluteUrl('payment/verify/evm'), {
+    return fetchJson(absoluteUrl(`payment/verify/evm/${encodeURIComponent(itemId)}`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ network: network.key, tx_hash: txHash, destination, min_amount: amountUsd }),
