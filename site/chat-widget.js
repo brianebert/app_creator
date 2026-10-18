@@ -61,10 +61,17 @@ function mountChatTopic(container, options) {
   // links to this one by filename (confirmed live on the "Elect Nobody"
   // app, which is multi-page - its chat broke exactly this way until fixed
   // with a mount-name-aware version instead of this position-based one).
+  // Fixed: for a /documents/<namespace>/... URL, the mount root is
+  // 'documents' PLUS the namespace (two segments, not zero) - slicing to
+  // just docsIndex dropped the namespace entirely, silently routing every
+  // call to this sidecar's bare root instead of the right document.
+  // Confirmed live (chassis's own /pricing page, built on this same
+  // pattern) that this failed 100% of the time under /documents/, never
+  // intermittently.
   function pathPrefix() {
     const segments = window.location.pathname.split('/').filter(Boolean);
     const docsIndex = segments.indexOf('documents');
-    const prefixSegments = docsIndex !== -1 ? segments.slice(0, docsIndex) : segments.slice(0, -1);
+    const prefixSegments = docsIndex !== -1 ? segments.slice(0, docsIndex + 2) : segments.slice(0, -1);
     return prefixSegments.length ? `/${prefixSegments.join('/')}` : '';
   }
 

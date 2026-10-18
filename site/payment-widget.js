@@ -63,10 +63,18 @@ function mountPaymentWidget(container, options) {
   // same reason: every harness-built site is single-page, so the page's
   // own mount root is always exactly one segment short of its own URL. Do
   // not copy this into a multi-page app (see chat-widget.js's own note).
+  //
+  // Fixed: for a /documents/<namespace>/... URL, the mount root is
+  // 'documents' PLUS the namespace (two segments, not zero) - slicing to
+  // just docsIndex dropped the namespace entirely, silently routing every
+  // call to this sidecar's bare root instead of the right document.
+  // Confirmed live (chassis's own /pricing page, built on this same
+  // pattern) that this failed 100% of the time under /documents/, never
+  // intermittently.
   function pathPrefix() {
     const segments = window.location.pathname.split('/').filter(Boolean);
     const docsIndex = segments.indexOf('documents');
-    const prefixSegments = docsIndex !== -1 ? segments.slice(0, docsIndex) : segments.slice(0, -1);
+    const prefixSegments = docsIndex !== -1 ? segments.slice(0, docsIndex + 2) : segments.slice(0, -1);
     return prefixSegments.length ? `/${prefixSegments.join('/')}` : '';
   }
 
