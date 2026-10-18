@@ -82,6 +82,14 @@ function mountChatTopic(container, options) {
     return new URL(`${pathPrefix()}/${path}`, window.location.origin).toString();
   }
 
+  // GET /stats.json is a bare, sidecar-level route (this sidecar's own
+  // stats, not this app's) - unlike doc/blob, it is NOT namespace-scoped,
+  // so it must be called at the sidecar's own root, never through this
+  // app's mount prefix.
+  function bareUrl(path) {
+    return new URL(`/${path}`, window.location.origin).toString();
+  }
+
   // Unlike pathPrefix() above (which deliberately drops this page's own
   // mount segment to reach the *sidecar's* root, for calls like minting an
   // unrelated document or reading sidecar-wide stats), this keeps it - it's
@@ -138,7 +146,7 @@ function mountChatTopic(container, options) {
   let mySidecarEndpointId = null;
 
   async function fetchMyEndpointId() {
-    const stats = await fetchJson(absoluteUrl('stats.json'));
+    const stats = await fetchJson(bareUrl('stats.json'));
     mySidecarEndpointId = stats.endpoint_id;
   }
 

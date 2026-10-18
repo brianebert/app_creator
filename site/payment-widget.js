@@ -79,6 +79,15 @@ function mountPaymentWidget(container, options) {
     return new URL(`${pathPrefix()}/${path}`, window.location.origin).toString();
   }
 
+  // GET /payment/networks is deliberately a bare, app-agnostic route on
+  // every sidecar (same network/token list regardless of which app asks)
+  // - unlike doc/blob/payment-verify, it is NOT namespace-scoped, so it
+  // must be called at the sidecar's own root, never through this app's
+  // mount prefix.
+  function bareUrl(path) {
+    return new URL(`/${path}`, window.location.origin).toString();
+  }
+
   async function fetchJson(url, opts) {
     const response = await fetch(url, opts);
     if (!response.ok) throw new Error(await response.text());
@@ -138,7 +147,7 @@ function mountPaymentWidget(container, options) {
         descriptionEl.textContent = description;
       }
 
-      const all = await fetchJson(absoluteUrl('payment/networks'));
+      const all = await fetchJson(bareUrl('payment/networks'));
       networks = all.networks.filter((n) => Boolean(destinationFor(n)));
       if (networks.length === 0) {
         throw new Error(`pricing/${itemId}'s destination has no chain this sidecar supports`);
