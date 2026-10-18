@@ -53,26 +53,29 @@ function mountChatTopic(container, options) {
 
   injectStylesOnce();
 
-  // This assumes the page is always loaded at its own mount root (by name,
-  // or by /documents/<hash>/) and never at a sibling filename - true for
+  // The page is always loaded at its own mount root (by name, or by
+  // /documents/<namespace>/) and never at a sibling filename - true for
   // every site this harness builds, since it only ever produces one HTML
-  // file. Do NOT copy this pathPrefix() into a multi-page app: dropping the
-  // trailing path segment breaks the moment a real second page exists and
-  // links to this one by filename (confirmed live on the "Elect Nobody"
-  // app, which is multi-page - its chat broke exactly this way until fixed
-  // with a mount-name-aware version instead of this position-based one).
-  // Fixed: for a /documents/<namespace>/... URL, the mount root is
-  // 'documents' PLUS the namespace (two segments, not zero) - slicing to
-  // just docsIndex dropped the namespace entirely, silently routing every
-  // call to this sidecar's bare root instead of the right document.
-  // Confirmed live (chassis's own /pricing page, built on this same
-  // pattern) that this failed 100% of the time under /documents/, never
-  // intermittently.
+  // file and chassis serves it AT the bare mount path, never at a literal
+  // trailing /index.html. Do NOT copy this pathPrefix() into a multi-page
+  // app, where that's no longer true (confirmed live on the "Elect
+  // Nobody" app, which is multi-page - its chat broke exactly this way
+  // until fixed with a mount-name-aware version instead of this
+  // position-based one).
+  //
+  // Given the assumption above, the whole path - not the path minus its
+  // last segment - IS the prefix: there is no filename segment to drop.
+  // An earlier version of this function dropped the last segment anyway
+  // (a leftover from treating this like a multi-segment asset path),
+  // which silently deleted the one and only segment - the mount name
+  // itself - for the single most common way anyone reaches a real app
+  // (its own bare /<name> URL). Confirmed live as the actual cause of
+  // payment-widget.js 404ing on every call for a real, normally-viewed
+  // app, not the narrower /documents/<namespace>/... case a previous fix
+  // addressed.
   function pathPrefix() {
     const segments = window.location.pathname.split('/').filter(Boolean);
-    const docsIndex = segments.indexOf('documents');
-    const prefixSegments = docsIndex !== -1 ? segments.slice(0, docsIndex + 2) : segments.slice(0, -1);
-    return prefixSegments.length ? `/${prefixSegments.join('/')}` : '';
+    return segments.length ? `/${segments.join('/')}` : '';
   }
 
   function absoluteUrl(path) {

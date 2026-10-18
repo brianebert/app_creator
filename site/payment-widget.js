@@ -59,23 +59,20 @@ function mountPaymentWidget(container, options) {
 
   injectStylesOnce();
 
-  // Same position-based prefix as chat-widget.js - correct here for the
-  // same reason: every harness-built site is single-page, so the page's
-  // own mount root is always exactly one segment short of its own URL. Do
-  // not copy this into a multi-page app (see chat-widget.js's own note).
-  //
-  // Fixed: for a /documents/<namespace>/... URL, the mount root is
-  // 'documents' PLUS the namespace (two segments, not zero) - slicing to
-  // just docsIndex dropped the namespace entirely, silently routing every
-  // call to this sidecar's bare root instead of the right document.
-  // Confirmed live (chassis's own /pricing page, built on this same
-  // pattern) that this failed 100% of the time under /documents/, never
-  // intermittently.
+  // The "drop the last path segment, it's a filename" idea this used to
+  // use (still correct for a page like chassis's own /pricing admin page)
+  // does not apply here: chassis serves this harness's index.html AT the
+  // bare mount path, never at a literal trailing /index.html, so there is
+  // no filename segment in window.location.pathname to drop - the whole
+  // path (mount name, or 'documents'+namespace, or a reverse-proxy prefix
+  // in front of either) IS the prefix. Dropping the last segment of
+  // /life.10 or /life.10/ was deleting the one and only segment - the
+  // mount name itself - confirmed live as the cause of every fetch from
+  // this widget 404ing against a real, normally-reached app (not the
+  // /documents/<namespace>/... form a previous, narrower fix addressed).
   function pathPrefix() {
     const segments = window.location.pathname.split('/').filter(Boolean);
-    const docsIndex = segments.indexOf('documents');
-    const prefixSegments = docsIndex !== -1 ? segments.slice(0, docsIndex + 2) : segments.slice(0, -1);
-    return prefixSegments.length ? `/${prefixSegments.join('/')}` : '';
+    return segments.length ? `/${segments.join('/')}` : '';
   }
 
   function absoluteUrl(path) {
