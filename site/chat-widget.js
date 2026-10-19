@@ -82,22 +82,36 @@ function mountChatTopic(container, options) {
     return new URL(`${pathPrefix()}/${path}`, window.location.origin).toString();
   }
 
-  // GET /stats.json is a bare, sidecar-level route (this sidecar's own
-  // stats, not this app's) - unlike doc/blob, it is NOT namespace-scoped,
-  // so it must be called at the sidecar's own root, never through this
-  // app's mount prefix.
-  function bareUrl(path) {
-    return new URL(`/${path}`, window.location.origin).toString();
+  // Whatever a reverse proxy in front of this sidecar stripped (e.g.
+  // '/apps' on nobody.news) - everything in the current URL BEFORE this
+  // app's own mount segment(s), never including them. Needed for a bare,
+  // app-agnostic route (stats.json) and for addressing a DIFFERENT
+  // namespace's document (documentsUrl below) - pathPrefix() would wrongly
+  // mix this app's own name/namespace into either.
+  function proxyPrefix() {
+    const segments = window.location.pathname.split('/').filter(Boolean);
+    const docsIndex = segments.indexOf('documents');
+    const proxySegments = docsIndex !== -1 ? segments.slice(0, docsIndex) : segments.slice(0, -1);
+    return proxySegments.length ? `/${proxySegments.join('/')}` : '';
   }
 
-  // Unlike pathPrefix() above (which deliberately drops this page's own
-  // mount segment to reach the *sidecar's* root, for calls like minting an
-  // unrelated document or reading sidecar-wide stats), this keeps it - it's
-  // for reading a key out of *this app's own* document. Safe only because
-  // every app this harness builds is single-page (same assumption
-  // pathPrefix() already documents): the current path, minus a trailing
-  // `index.html` filename or trailing slash, is just this app's own mount
-  // root either way it was reached (`/<name>/` or `/documents/<hash>/`).
+  // GET /stats.json is a bare, sidecar-level route (this sidecar's own
+  // stats, not this app's) - unlike doc/blob, it is NOT namespace-scoped,
+  // so it must be called through the reverse-proxy prefix only, never
+  // this app's own mount prefix.
+  function bareUrl(path) {
+    return new URL(`${proxyPrefix()}/${path}`, window.location.origin).toString();
+  }
+
+  // A second, independent way to reach this app's own mount prefix
+  // (pathPrefix() above is the other) - strips a trailing filename or
+  // slash rather than counting segments. Both are correct and should
+  // agree; kept separate rather than unified to avoid touching working,
+  // unrelated code while fixing proxyPrefix()/documentsUrl() above. Safe
+  // because every app this harness builds is single-page: the current
+  // path, minus a trailing `index.html` filename or trailing slash, is
+  // just this app's own mount root either way it was reached (`/<name>/`
+  // or `/documents/<namespace>/`).
   function ownAppPrefix() {
     let path = window.location.pathname;
     if (path.endsWith('/index.html')) path = path.slice(0, -'index.html'.length);
@@ -192,8 +206,17 @@ function mountChatTopic(container, options) {
     writeTicket = created.write_ticket;
   }
 
+  // Addresses a DIFFERENT namespace's document (the cross-topic mode's own
+  // topic, not this app's) - needs proxyPrefix(), not pathPrefix(): this
+  // app's own mount name/namespace has no business in a /documents/<ns>/
+  // path for a namespace that isn't it. Confirmed via chassis's own
+  // document_route_path, which requires '/documents/' to be the literal
+  // start of the path it's matching against - prepending this app's own
+  // mount segment(s) in front of it (what absoluteUrl()/pathPrefix()
+  // would do) made every call here fail to resolve at all, in both the
+  // plain and reverse-proxied cases.
   function documentsUrl(path) {
-    return absoluteUrl(`documents/${namespace}/${path}`);
+    return new URL(`${proxyPrefix()}/documents/${namespace}/${path}`, window.location.origin).toString();
   }
 
   // Ensures this sidecar has actually joined an existing topic's namespace

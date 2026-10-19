@@ -79,13 +79,28 @@ function mountPaymentWidget(container, options) {
     return new URL(`${pathPrefix()}/${path}`, window.location.origin).toString();
   }
 
+  // Whatever a reverse proxy in front of this sidecar stripped (e.g.
+  // '/apps' on nobody.news) - everything in the current URL BEFORE this
+  // app's own mount segment(s), never including them. A bare,
+  // app-agnostic route needs exactly this, not pathPrefix(): hardcoding
+  // an empty prefix here would work directly against a sidecar but drop
+  // a real reverse-proxy prefix, 404ing there instead - the same mistake
+  // pathPrefix() used to make for namespace-scoped calls, just for the
+  // opposite kind of route.
+  function proxyPrefix() {
+    const segments = window.location.pathname.split('/').filter(Boolean);
+    const docsIndex = segments.indexOf('documents');
+    const proxySegments = docsIndex !== -1 ? segments.slice(0, docsIndex) : segments.slice(0, -1);
+    return proxySegments.length ? `/${proxySegments.join('/')}` : '';
+  }
+
   // GET /payment/networks is deliberately a bare, app-agnostic route on
   // every sidecar (same network/token list regardless of which app asks)
   // - unlike doc/blob/payment-verify, it is NOT namespace-scoped, so it
-  // must be called at the sidecar's own root, never through this app's
-  // mount prefix.
+  // must be called through the reverse-proxy prefix only, never this
+  // app's own mount prefix.
   function bareUrl(path) {
-    return new URL(`/${path}`, window.location.origin).toString();
+    return new URL(`${proxyPrefix()}/${path}`, window.location.origin).toString();
   }
 
   async function fetchJson(url, opts) {
