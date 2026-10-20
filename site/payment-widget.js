@@ -208,9 +208,14 @@ function mountPaymentWidget(container, options) {
   async function payOnStellar(network) {
     const destination = destinationFor(network);
     setStatus('Loading Stellar libraries...');
+    // Pinned, not @latest - the exact bug just above (requestAccess()'s
+    // real field is publicKey, not address) was only findable by reading
+    // the actual bundle a floating @latest happened to resolve to at the
+    // time; an unpinned import can silently change shape again with zero
+    // code change on our side. Bump these deliberately, not implicitly.
     const [sdk, freighterModule] = await Promise.all([
-      import('https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@latest/+esm'),
-      import('https://cdn.jsdelivr.net/npm/@stellar/freighter-api@latest/+esm'),
+      import('https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@17.2.1/+esm'),
+      import('https://cdn.jsdelivr.net/npm/@stellar/freighter-api@6.0.1/+esm'),
     ]);
     const { TransactionBuilder, Account, Asset, Operation, Networks, BASE_FEE } = sdk;
     const freighter = freighterModule.default;
@@ -225,7 +230,13 @@ function mountPaymentWidget(container, options) {
     // mechanism was built to prevent, just at a different step.
     const access = await withTimeout(freighter.requestAccess(), 120000, 'Connecting to Freighter');
     if (access.error) throw new Error(access.error.message || String(access.error));
-    const address = access.address;
+    // The freighter-api package's own requestAccess() resolves
+    // {publicKey, error} - not {address, error}. Confirmed by reading the
+    // actual @latest bundle shipped from jsdelivr (2026-10-20); the wrong
+    // field name here silently left `address` undefined on every call,
+    // which only surfaces downstream as a broken accounts/undefined
+    // lookup, not as an error at the point Freighter itself is called.
+    const address = access.publicKey;
 
     setStatus('Building the payment transaction...');
     const accountResp = await fetch(network.horizon_base + '/accounts/' + address);
