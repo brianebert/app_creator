@@ -619,7 +619,17 @@ def _drive_until_stopped(messages: list) -> tuple[str, bool]:
             )
         response = client.messages.create(
             model=MODEL,
-            max_tokens=4096,
+            # 4096 was too tight: a turn that used up its output budget
+            # mid-generation (e.g. partway through a large write_file call)
+            # came back as a normal stop with empty/partial text rather
+            # than an error, which this loop can't tell apart from the
+            # model genuinely having nothing to say - confirmed live
+            # 2026-10-20, a build stalled with zero files written and an
+            # empty last_reply right after its first real batch of tool
+            # calls. Raised well above what one file-plus-narration turn
+            # should ever need; cost is billed on actual usage.output_tokens
+            # either way, not on this ceiling.
+            max_tokens=8192,
             # Cached: SYSTEM_PROMPT is identical on every turn of a session
             # and grew substantially once CHASSIS_REFERENCE was added - the
             # cost formula below already accounted for cache pricing, this
