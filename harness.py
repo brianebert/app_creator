@@ -286,7 +286,20 @@ default private conversation already uses under the hood (its
   // hits this branch somewhere it can't write.
   async function ensureFeed(pointerKey) {
     const existing = await fetchJson(`doc?prefix=${pointerKey}&inline=1`);
-    if (existing[0]?.content) return JSON.parse(existing[0].content).namespace;
+    if (existing[0]?.content) {
+      const {namespace, ticket} = JSON.parse(existing[0].content);
+      // Reading the pointer back from THIS site's own document says
+      // nothing about whether the sidecar serving THIS page has ever
+      // joined the feed's own document - only the sidecar that minted it
+      // has, by default. Joining is idempotent and cheap even when
+      // already local (see POST /doc's own handling of an already-open
+      // namespace), so call it every time rather than only at mint time -
+      // this is the same join-before-every-use pattern chat-widget.js's
+      // own joinExistingTopic() uses for the identical reason.
+      const joinParams = new URLSearchParams({name: pointerKey, ticket, listed: '0'});
+      await fetchBareJson(`doc?${joinParams}`, {method: 'POST'});
+      return namespace;
+    }
     const params = new URLSearchParams({name: pointerKey, listed: '0'});
     // Bare POST /doc with no ticket/secret mints a brand new document - one
     // of the few routes fetchBareJson() exists for (see its own comment
