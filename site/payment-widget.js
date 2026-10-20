@@ -230,13 +230,7 @@ function mountPaymentWidget(container, options) {
     // mechanism was built to prevent, just at a different step.
     const access = await withTimeout(freighter.requestAccess(), 120000, 'Connecting to Freighter');
     if (access.error) throw new Error(access.error.message || String(access.error));
-    // The freighter-api package's own requestAccess() resolves
-    // {publicKey, error} - not {address, error}. Confirmed by reading the
-    // actual @latest bundle shipped from jsdelivr (2026-10-20); the wrong
-    // field name here silently left `address` undefined on every call,
-    // which only surfaces downstream as a broken accounts/undefined
-    // lookup, not as an error at the point Freighter itself is called.
-    const address = access.publicKey;
+    const address = access.address;
 
     setStatus('Building the payment transaction...');
     const accountResp = await fetch(network.horizon_base + '/accounts/' + address);
