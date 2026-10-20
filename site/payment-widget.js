@@ -216,7 +216,14 @@ function mountPaymentWidget(container, options) {
     const freighter = freighterModule.default;
 
     setStatus('Connecting to Freighter...');
-    const access = await withTimeout(freighter.requestAccess(), 30000, 'Connecting to Freighter');
+    // 120s, not a short "is the extension even there" timeout - this shows
+    // a real approval popup ("this site wants to connect") the first time,
+    // which takes genuine human reaction time and can involve unlocking
+    // Freighter first. A short timeout here was confirmed live to kill a
+    // real, successful connection in progress just because the visitor
+    // hadn't clicked yet (2026-10-20) - the exact failure mode this whole
+    // mechanism was built to prevent, just at a different step.
+    const access = await withTimeout(freighter.requestAccess(), 120000, 'Connecting to Freighter');
     if (access.error) throw new Error(access.error.message || String(access.error));
     const address = access.address;
 
@@ -266,20 +273,25 @@ function mountPaymentWidget(container, options) {
     const destination = destinationFor(network);
     if (!window.ethereum) throw new Error('MetaMask is not available');
     setStatus('Connecting to MetaMask...');
+    // 120s - same reasoning as requestAccess()'s own comment in
+    // payOnStellar above: this shows a real connection-approval popup the
+    // first time, not an automatic handshake.
     const [account] = await withTimeout(
       window.ethereum.request({ method: 'eth_requestAccounts' }),
-      30000,
+      120000,
       'Connecting to MetaMask'
     );
 
     setStatus('Switching network...');
     try {
+      // Also 120s - switching to a network the wallet doesn't already
+      // have active can show its own approval popup, not just run silently.
       await withTimeout(
         window.ethereum.request({
           method: 'wallet_switchEthereumChain',
           params: [{ chainId: network.chain_id_hex }],
         }),
-        30000,
+        120000,
         "Switching MetaMask's network"
       );
     } catch (switchError) {
