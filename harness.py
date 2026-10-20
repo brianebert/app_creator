@@ -228,48 +228,73 @@ something this code can know in advance:
     return response.json();
   }
 
-The simple, common case - one shared feed living on this site's own
-document (a guestbook, a comment thread, a single chat room) - needs no
-setup step and no credential in the request; write access is a property
-of the server that ends up hosting the site, not of who's asking:
+Any shared data that VISITORS write - a guestbook, a comment thread, a
+live feed, a chat room, anything a payment unlocks posting into - must
+live in a document separate from this site's own, never written directly
+into keys on this site's own document. Once the user imports/publishes
+this site, its OWN document becomes read-only on every sidecar except the
+one it was first published to - every OTHER copy of the site (the normal
+way most visitors will ever reach it) can read that document fine but can
+never write to it, so a visitor-facing write placed there will silently
+succeed for the publisher and silently fail for everyone else, with no
+error that points at the real cause.
+
+Instead, mint a dedicated document for the feed and store a
+{namespace, ticket} pointer to it under a key on this site's own
+document. Any visitor can read that pointer fine - it's just data on an
+otherwise read-only document - and the pointer's own ticket grants real,
+on-the-spot write access to the SEPARATE document it names, on whatever
+sidecar is asking, independent of what access that sidecar has to this
+site's own document. This is exactly the mechanism chat-widget.js's own
+default private conversation already uses under the hood (its
+`chat.private-topic` pointer) - here it is spelled out for a custom feed:
+
+  function documentsUrl(namespace, path) {
+    return new URL(`/documents/${namespace}/${path}`, window.location.origin).toString();
+  }
+
+  // Finds the feed's own document if it already exists, or mints one and
+  // registers its pointer if not. The mint-and-register branch needs
+  // write access to THIS site's own document, which is only guaranteed on
+  // the sidecar it was first published to - tell the user to load this
+  // page once from wherever they just clicked Import, before sharing the
+  // link further, so the feed exists before anyone else's first visit
+  // hits this branch somewhere it can't write.
+  async function ensureFeed(pointerKey) {
+    const existing = await fetchJson(`doc?prefix=${pointerKey}&inline=1`);
+    if (existing[0]?.content) return JSON.parse(existing[0].content).namespace;
+    const params = new URLSearchParams({name: pointerKey, listed: '0'});
+    const {namespace, write_ticket} = await fetchJson(`doc?${params}`, {method: 'POST'});
+    const pointerBlob = await fetchJson('blob', {
+      method: 'POST', body: JSON.stringify({namespace, ticket: write_ticket}),
+    });
+    await fetchJson(`doc/${pointerKey}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hash: pointerBlob.hash, size: pointerBlob.size}),
+    });
+    return namespace;
+  }
 
   // write one entry
+  const namespace = await ensureFeed('feed.topic');
   const body = JSON.stringify({sender, ts: Date.now(), text});
-  const blob = await fetchJson('blob', {method: 'POST', body});
+  const blob = await fetchJson(documentsUrl(namespace, 'blob'), {method: 'POST', body});
   const key = `msg/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await fetchJson(`doc/${key}`, {
+  await fetchJson(documentsUrl(namespace, `doc/${key}`), {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({hash: blob.hash, size: blob.size}),
   });
 
   // read entries back - poll this on an interval for something "live"
-  const entries = await fetchJson('doc?prefix=msg/&inline=1');
+  const entries = await fetchJson(documentsUrl(namespace, 'doc?prefix=msg/&inline=1'));
   // each entry: {key, hash, size, content} - content is the stored
   // bytes as text, present because inline=1 and the blob is small
 
-If the user wants several independent rooms/threads rather than one
-shared feed, mint a separate document per room (a bare POST /doc with no
-ticket creates one; a ticket means "import an existing one" instead) and
-keep a {namespace, ticket} pointer to it under this site's own
-`topics/<name>` key, then address that room's own document explicitly by
-namespace for its own entries:
-
-  const params = new URLSearchParams({name: roomName, listed: '0'});
-  const {namespace, write_ticket} = await fetchJson(`doc?${params}`, {method: 'POST'});
-  const pointerBlob = await fetchJson('blob', {
-    method: 'POST', body: JSON.stringify({namespace, ticket: write_ticket}),
-  });
-  await fetchJson(`doc/topics/${encodeURIComponent(roomName)}`, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({hash: pointerBlob.hash, size: pointerBlob.size}),
-  });
-
-  function documentsUrl(namespace, path) {
-    return new URL(`/documents/${namespace}/${path}`, window.location.origin).toString();
-  }
-  // then read/write that room's own msg/* entries via documentsUrl(namespace, ...)
-  // in place of the plain paths in the simple case above
+If the user wants several independent rooms rather than one shared feed,
+call ensureFeed with a distinct pointerKey per room (e.g.
+`topics/<roomName>`) and keep each room's own namespace separate, the
+same way chat-widget.js's own "join a different conversation" mode does.
 """
 
 # Appended to the user's own message on every /chat turn (not folded into
