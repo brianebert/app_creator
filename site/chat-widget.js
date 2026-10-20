@@ -53,41 +53,14 @@ function mountChatTopic(container, options) {
 
   injectStylesOnce();
 
-  // The page is always loaded at its own mount root (by name, or by
-  // /documents/<namespace>/) and never at a sibling filename - true for
-  // every site this harness builds, since it only ever produces one HTML
-  // file and chassis serves it AT the bare mount path, never at a literal
-  // trailing /index.html. Do NOT copy this pathPrefix() into a multi-page
-  // app, where that's no longer true (confirmed live on the "Elect
-  // Nobody" app, which is multi-page - its chat broke exactly this way
-  // until fixed with a mount-name-aware version instead of this
-  // position-based one).
-  //
-  // Given the assumption above, the whole path - not the path minus its
-  // last segment - IS the prefix: there is no filename segment to drop.
-  // An earlier version of this function dropped the last segment anyway
-  // (a leftover from treating this like a multi-segment asset path),
-  // which silently deleted the one and only segment - the mount name
-  // itself - for the single most common way anyone reaches a real app
-  // (its own bare /<name> URL). Confirmed live as the actual cause of
-  // payment-widget.js 404ing on every call for a real, normally-viewed
-  // app, not the narrower /documents/<namespace>/... case a previous fix
-  // addressed.
-  function pathPrefix() {
-    const segments = window.location.pathname.split('/').filter(Boolean);
-    return segments.length ? `/${segments.join('/')}` : '';
-  }
-
-  function absoluteUrl(path) {
-    return new URL(`${pathPrefix()}/${path}`, window.location.origin).toString();
-  }
-
   // Whatever a reverse proxy in front of this sidecar stripped (e.g.
   // '/apps' on nobody.news) - everything in the current URL BEFORE this
   // app's own mount segment(s), never including them. Needed for a bare,
-  // app-agnostic route (stats.json) and for addressing a DIFFERENT
-  // namespace's document (documentsUrl below) - pathPrefix() would wrongly
-  // mix this app's own name/namespace into either.
+  // app-agnostic route (stats.json, and the top-level POST /doc used to
+  // mint/join a document - chassis matches both at the literal start of
+  // the request path, so this app's own mount name must never be
+  // prepended in front of them) and for addressing a DIFFERENT namespace's
+  // document (documentsUrl below).
   function proxyPrefix() {
     const segments = window.location.pathname.split('/').filter(Boolean);
     const docsIndex = segments.indexOf('documents');
@@ -103,15 +76,13 @@ function mountChatTopic(container, options) {
     return new URL(`${proxyPrefix()}/${path}`, window.location.origin).toString();
   }
 
-  // A second, independent way to reach this app's own mount prefix
-  // (pathPrefix() above is the other) - strips a trailing filename or
-  // slash rather than counting segments. Both are correct and should
-  // agree; kept separate rather than unified to avoid touching working,
-  // unrelated code while fixing proxyPrefix()/documentsUrl() above. Safe
-  // because every app this harness builds is single-page: the current
-  // path, minus a trailing `index.html` filename or trailing slash, is
-  // just this app's own mount root either way it was reached (`/<name>/`
-  // or `/documents/<namespace>/`).
+  // This app's own mount prefix, for calls scoped to this app's own
+  // document (reading its own doc entries - see tryJoinPrivateChatTopic
+  // below). Strips a trailing filename or slash rather than counting
+  // segments; safe because every app this harness builds is single-page:
+  // the current path, minus a trailing `index.html` filename or trailing
+  // slash, is just this app's own mount root either way it was reached
+  // (`/<name>/` or `/documents/<namespace>/`).
   function ownAppPrefix() {
     let path = window.location.pathname;
     if (path.endsWith('/index.html')) path = path.slice(0, -'index.html'.length);
@@ -183,7 +154,7 @@ function mountChatTopic(container, options) {
         name: 'private-chat',
         listed: '0',
       });
-      const joined = await fetchJson(absoluteUrl(`doc?${params}`), { method: 'POST' });
+      const joined = await fetchJson(bareUrl(`doc?${params}`), { method: 'POST' });
       namespace = joined.namespace;
       writeTicket = joined.write_ticket;
       return true;
@@ -201,20 +172,19 @@ function mountChatTopic(container, options) {
   async function ensureTopic() {
     if (await tryJoinPrivateChatTopic()) return;
     const params = new URLSearchParams({ name: topicName, listed: '0' });
-    const created = await fetchJson(absoluteUrl(`doc?${params}`), { method: 'POST' });
+    const created = await fetchJson(bareUrl(`doc?${params}`), { method: 'POST' });
     namespace = created.namespace;
     writeTicket = created.write_ticket;
   }
 
   // Addresses a DIFFERENT namespace's document (the cross-topic mode's own
-  // topic, not this app's) - needs proxyPrefix(), not pathPrefix(): this
-  // app's own mount name/namespace has no business in a /documents/<ns>/
-  // path for a namespace that isn't it. Confirmed via chassis's own
-  // document_route_path, which requires '/documents/' to be the literal
-  // start of the path it's matching against - prepending this app's own
-  // mount segment(s) in front of it (what absoluteUrl()/pathPrefix()
-  // would do) made every call here fail to resolve at all, in both the
-  // plain and reverse-proxied cases.
+  // topic, not this app's) - needs proxyPrefix(), not this app's own
+  // mount prefix: this app's own mount name/namespace has no business in
+  // a /documents/<ns>/ path for a namespace that isn't it. Confirmed via
+  // chassis's own document_route_path, which requires '/documents/' to be
+  // the literal start of the path it's matching against - prepending this
+  // app's own mount segment(s) in front of it made every call here fail
+  // to resolve at all, in both the plain and reverse-proxied cases.
   function documentsUrl(path) {
     return new URL(`${proxyPrefix()}/documents/${namespace}/${path}`, window.location.origin).toString();
   }
@@ -232,7 +202,7 @@ function mountChatTopic(container, options) {
       skip_shape_detection: '1',
       listed: '0',
     });
-    await fetch(absoluteUrl(`doc?${params}`), { method: 'POST' });
+    await fetch(bareUrl(`doc?${params}`), { method: 'POST' });
   }
 
   const MAX_RENDERED = 50;
