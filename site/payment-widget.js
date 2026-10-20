@@ -126,6 +126,24 @@ function mountPaymentWidget(container, options) {
     statusEl.textContent = message || '';
   }
 
+  // Wallet calls (Freighter's requestAccess/signTransaction, MetaMask's
+  // eth_requestAccounts) talk to a browser extension that may not be
+  // installed, may be locked, or may show a popup the visitor never
+  // answers - none of which reject on their own, so an unwrapped await
+  // here just freezes the page on whatever status line was showing, with
+  // no error and no way to retry short of a full reload. Confirmed live
+  // 2026-10-20: a visitor without Freighter installed got stuck forever on
+  // "Connecting to Freighter...". Every such call below goes through this
+  // instead, so it fails loudly and leaves the Pay button clickable again.
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} timed out - is the wallet extension installed and unlocked?`)), ms)
+      ),
+    ]);
+  }
+
   let networks = [];
   function currentNetwork() {
     return networks.find((n) => n.key === networkSelect.value);
@@ -198,7 +216,7 @@ function mountPaymentWidget(container, options) {
     const freighter = freighterModule.default;
 
     setStatus('Connecting to Freighter...');
-    const access = await freighter.requestAccess();
+    const access = await withTimeout(freighter.requestAccess(), 30000, 'Connecting to Freighter');
     if (access.error) throw new Error(access.error.message || String(access.error));
     const address = access.address;
 
@@ -223,10 +241,17 @@ function mountPaymentWidget(container, options) {
       .build();
 
     setStatus('Approve the payment in Freighter...');
-    const signed = await freighter.signTransaction(tx.toXDR(), {
-      networkPassphrase: Networks.TESTNET,
-      address,
-    });
+    // Longer timeout here on purpose - this one legitimately waits on the
+    // visitor reading and approving a popup, not just the extension
+    // responding.
+    const signed = await withTimeout(
+      freighter.signTransaction(tx.toXDR(), {
+        networkPassphrase: Networks.TESTNET,
+        address,
+      }),
+      120000,
+      'Approving the payment in Freighter'
+    );
     if (signed.error) throw new Error(signed.error.message || String(signed.error));
 
     setStatus('Submitting payment...');
@@ -241,14 +266,22 @@ function mountPaymentWidget(container, options) {
     const destination = destinationFor(network);
     if (!window.ethereum) throw new Error('MetaMask is not available');
     setStatus('Connecting to MetaMask...');
-    const [account] = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const [account] = await withTimeout(
+      window.ethereum.request({ method: 'eth_requestAccounts' }),
+      30000,
+      'Connecting to MetaMask'
+    );
 
     setStatus('Switching network...');
     try {
-      await window.ethereum.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: network.chain_id_hex }],
-      });
+      await withTimeout(
+        window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: network.chain_id_hex }],
+        }),
+        30000,
+        "Switching MetaMask's network"
+      );
     } catch (switchError) {
       if (switchError && switchError.code === 4902) {
         throw new Error('Add ' + network.label + ' to MetaMask first, then try again.');
@@ -265,10 +298,16 @@ function mountPaymentWidget(container, options) {
     const data = '0x' + selector + destinationWord + amountWord;
 
     setStatus('Approve the payment in MetaMask...');
-    const txHash = await window.ethereum.request({
-      method: 'eth_sendTransaction',
-      params: [{ from: account, to: network.usdc_contract, data, value: '0x0' }],
-    });
+    // Longer timeout here on purpose - same reasoning as signTransaction's
+    // own comment in payOnStellar above.
+    const txHash = await withTimeout(
+      window.ethereum.request({
+        method: 'eth_sendTransaction',
+        params: [{ from: account, to: network.usdc_contract, data, value: '0x0' }],
+      }),
+      120000,
+      'Approving the payment in MetaMask'
+    );
 
     setStatus('Waiting for the transaction to be mined - this can take a minute...');
     return fetchJson(absoluteUrl(`payment/verify/evm/${encodeURIComponent(itemId)}`), {
