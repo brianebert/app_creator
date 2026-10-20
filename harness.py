@@ -419,6 +419,14 @@ _state = {
     # from fresh narration via `activity`.
     "last_reply": None,
     "reply_seq": 0,
+    # Raw diagnostics from the most recent API response - added 2026-10-20
+    # after a build stalled twice in a row with an empty last_reply and no
+    # files written, with no way to tell "the model genuinely said nothing"
+    # from "this turn got cut off mid-generation" from the outside. Exposed
+    # via /status so that distinction is directly visible instead of
+    # inferred from cost deltas.
+    "last_stop_reason": None,
+    "last_output_tokens": None,
     # True while _drive_until_stopped is actively running, whether that's
     # the human-triggered call itself or a background continuation it
     # handed off to (see MAX_TOOL_ITERATIONS below) - True for longer than
@@ -619,17 +627,18 @@ def _drive_until_stopped(messages: list) -> tuple[str, bool]:
             )
         response = client.messages.create(
             model=MODEL,
-            # 4096 was too tight: a turn that used up its output budget
-            # mid-generation (e.g. partway through a large write_file call)
-            # came back as a normal stop with empty/partial text rather
-            # than an error, which this loop can't tell apart from the
-            # model genuinely having nothing to say - confirmed live
-            # 2026-10-20, a build stalled with zero files written and an
-            # empty last_reply right after its first real batch of tool
-            # calls. Raised well above what one file-plus-narration turn
-            # should ever need; cost is billed on actual usage.output_tokens
-            # either way, not on this ceiling.
-            max_tokens=8192,
+            # Raised twice now (4096 -> 8192 -> 16384) chasing the same
+            # symptom: a build stalls with zero files written and an empty
+            # last_reply right after its first real batch of tool calls.
+            # Doubling 4096 to 8192 did NOT fix it - the stall still
+            # happened, just after more real token spend (confirmed live
+            # 2026-10-20), meaning either the model is attempting something
+            # genuinely larger than that, or this isn't actually a
+            # max_tokens cutoff at all. last_stop_reason/last_output_tokens
+            # below exist specifically to settle which, instead of guessing
+            # again from cost deltas. Cost is billed on actual
+            # usage.output_tokens either way, not on this ceiling.
+            max_tokens=16384,
             # Cached: SYSTEM_PROMPT is identical on every turn of a session
             # and grew substantially once CHASSIS_REFERENCE was added - the
             # cost formula below already accounted for cache pricing, this
@@ -644,6 +653,8 @@ def _drive_until_stopped(messages: list) -> tuple[str, bool]:
             budget_exhausted = _state["cost_usd"] >= BUDGET_USD
             if budget_exhausted:
                 _state["status"] = "budget_exhausted"
+            _state["last_stop_reason"] = response.stop_reason
+            _state["last_output_tokens"] = response.usage.output_tokens
 
         assistant_content = [block.model_dump() for block in response.content]
         messages.append({"role": "assistant", "content": assistant_content})
@@ -1189,6 +1200,8 @@ class Handler(BaseHTTPRequestHandler):
                         "driving": _state["driving"],
                         "last_reply": _state["last_reply"],
                         "reply_seq": _state["reply_seq"],
+                        "last_stop_reason": _state["last_stop_reason"],
+                        "last_output_tokens": _state["last_output_tokens"],
                         "time_remaining_pct": time_remaining_pct,
                     }
                 )
