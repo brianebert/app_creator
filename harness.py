@@ -409,6 +409,16 @@ _state = {
     # the page's own fast interval during a turn to show a "Nobody says..."
     # line - see NOBODY_SAYINGS in INDEX_PAGE.
     "activity": None,
+    # The model's most recent genuine reply text - set whenever a batch
+    # (the human-triggered one or a later background continuation) ends
+    # with the model actually stopping (not mid-tool-call), so a reply that
+    # only finishes after the triggering /chat request already returned
+    # still reaches the page. reply_seq increments alongside it so the
+    # page can tell "a new reply arrived" from "still the same one" across
+    # repeated /status polls, the same way it already distinguishes stale
+    # from fresh narration via `activity`.
+    "last_reply": None,
+    "reply_seq": 0,
     # True while _drive_until_stopped is actively running, whether that's
     # the human-triggered call itself or a background continuation it
     # handed off to (see MAX_TOOL_ITERATIONS below) - True for longer than
@@ -632,6 +642,15 @@ def _drive_until_stopped(messages: list) -> tuple[str, bool]:
         )
 
         if budget_exhausted or response.stop_reason != "tool_use":
+            # The model genuinely stopped here, whether this is the batch
+            # a human's /chat request is still waiting on or a later
+            # background continuation it never sees directly - record it
+            # so the page's own poll loop can pick it up either way (see
+            # `last_reply`'s own comment for why this can't just rely on
+            # the triggering request's HTTP response).
+            with _lock:
+                _state["last_reply"] = final_text
+                _state["reply_seq"] += 1
             return final_text, False
 
         status_text = final_text.strip()
@@ -1002,12 +1021,27 @@ async function refreshStatus() {
 // (see MAX_TOOL_ITERATIONS in harness.py), and without this the narration
 // would go silent exactly while that's happening, which is indistinguishable
 // from actually being stuck.
+//
+// Also the ONLY place a reply bubble ever gets added (see lastSeenReplySeq
+// below) - a build that needs more than one batch finishes in the
+// background, past the point this page's own /chat fetch already
+// returned, so that fetch's own response can't be trusted to carry the
+// model's eventual real reply. reply_seq/last_reply (see harness.py's
+// `_state`) exist specifically so this poll loop - which keeps running
+// for exactly as long as driving=true - is guaranteed to see it instead,
+// whichever batch it actually finished in.
 let activityTimer = null;
+let lastSeenReplySeq = 0;
 async function pollActivity() {
   try {
     const r = await fetch('/status');
     const j = await r.json();
     appendNobodyLine(j.activity);
+    if (j.reply_seq > lastSeenReplySeq) {
+      lastSeenReplySeq = j.reply_seq;
+      addMsg('assistant', j.last_reply || '(no reply)');
+      refreshPreview();
+    }
     if (!j.driving && activityTimer) {
       clearInterval(activityTimer);
       activityTimer = null;
@@ -1036,18 +1070,12 @@ async function send() {
     if (j.error) {
       addMsg('assistant', 'Error: ' + j.error);
     } else {
-      // continuing=true with an empty reply means this batch ended on a
-      // tool call, mid-build, with nothing worth showing as a reply yet -
-      // a "(no reply)" bubble there would read as if the model had nothing
-      // to say, when it's actually still working (see pollActivity for how
-      // that ongoing work keeps showing up instead).
-      if (j.reply || !j.continuing) addMsg('assistant', j.reply || '(no reply)');
-      // Checked right here, off this response's own numbers, rather than
-      // waiting for the next poll - tokens only actually change when the
-      // model has just returned with something, so this is the real event
-      // to react to.
+      // The reply bubble itself (if this batch already finished) is
+      // rendered by pollActivity, off the shared reply_seq counter, not
+      // from this response directly - see pollActivity's own comment for
+      // why: this request can return before the model's real reply is
+      // ready, and relying on this response alone would silently drop it.
       checkThresholds(j.cost_usd, j.budget_usd, j.time_remaining_pct);
-      refreshPreview();
     }
   } finally {
     // activityTimer is deliberately left running here when the build is
@@ -1149,6 +1177,8 @@ class Handler(BaseHTTPRequestHandler):
                         "name": _state["name"],
                         "activity": _state["activity"],
                         "driving": _state["driving"],
+                        "last_reply": _state["last_reply"],
+                        "reply_seq": _state["reply_seq"],
                         "time_remaining_pct": time_remaining_pct,
                     }
                 )
