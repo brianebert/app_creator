@@ -228,6 +228,30 @@ something this code can know in advance:
     return response.json();
   }
 
+  // apiUrl() above is for calls scoped to THIS site's own document (doc,
+  // blob, payment/verify) - it resolves against the site's own mount path,
+  // which is exactly what those need. A small number of routes are
+  // different: bare, sidecar-level routes matched at the literal start of
+  // the request path, not nested under any app's mount name at all -
+  // `POST /doc` with no ticket/secret (mints a brand new document, used by
+  // ensureFeed() below) is one. Calling that through apiUrl() silently
+  // 404s the moment this site is actually imported/published (it works by
+  // accident in a bare, unprefixed local preview, which is exactly what
+  // makes this easy to miss): chassis matches `/doc` only when it is the
+  // very start of the path, so `/<this-site's-name>/doc` never resolves.
+  function proxyPrefix() {
+    const segments = window.location.pathname.split('/').filter(Boolean);
+    const docsIndex = segments.indexOf('documents');
+    const proxySegments = docsIndex !== -1 ? segments.slice(0, docsIndex) : segments.slice(0, -1);
+    return proxySegments.length ? `/${proxySegments.join('/')}` : '';
+  }
+  async function fetchBareJson(path, options) {
+    const url = new URL(`${proxyPrefix()}/${path}`, window.location.origin).toString();
+    const response = await fetch(url, options);
+    if (!response.ok) throw new Error(`${path}: ${response.status}`);
+    return response.json();
+  }
+
 Any shared data that VISITORS write - a guestbook, a comment thread, a
 live feed, a chat room, anything a payment unlocks posting into - must
 live in a document separate from this site's own, never written directly
@@ -264,7 +288,11 @@ default private conversation already uses under the hood (its
     const existing = await fetchJson(`doc?prefix=${pointerKey}&inline=1`);
     if (existing[0]?.content) return JSON.parse(existing[0].content).namespace;
     const params = new URLSearchParams({name: pointerKey, listed: '0'});
-    const {namespace, write_ticket} = await fetchJson(`doc?${params}`, {method: 'POST'});
+    // Bare POST /doc with no ticket/secret mints a brand new document - one
+    // of the few routes fetchBareJson() exists for (see its own comment
+    // above apiUrl()/fetchJson()). Everything else in this function writes
+    // to THIS site's own document instead, which correctly uses fetchJson.
+    const {namespace, write_ticket} = await fetchBareJson(`doc?${params}`, {method: 'POST'});
     const pointerBlob = await fetchJson('blob', {
       method: 'POST', body: JSON.stringify({namespace, ticket: write_ticket}),
     });
