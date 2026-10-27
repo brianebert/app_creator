@@ -157,8 +157,10 @@ in its own header comment.
 
 For a PAYMENT feature - charging a real price in crypto for something on
 this site - a ready-made component is likewise always present:
-`payment-widget.js`. It drives the wallet (Freighter for Stellar, MetaMask
-for Ethereum/Polygon) to build and sign a real USDC-testnet payment, then
+`payment-widget.js`. It pays with the visitor's own chassis wallet when
+their chassis has one (no extension needed - chassis shows its own
+approval window), or drives a wallet extension (Freighter for Stellar,
+MetaMask for Ethereum/Polygon), to make a real USDC-testnet payment, then
 has this platform independently verify the on-chain transaction before
 telling you it's paid - it never trusts the wallet's or the page's own
 claim. Wire it up with:

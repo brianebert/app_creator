@@ -48,6 +48,16 @@
 //
 // Testnet only, same as /create-app - real receiving addresses, fake
 // money. Users pay their own network fee; there is no fee sponsorship yet.
+//
+// Chassis wallet: when this app is served from its own origin on a chassis
+// that holds a wallet (GET <app>/wallet/available), "Chassis wallet" is
+// offered first and selected by default - no extension, no account setup.
+// Clicking Pay opens chassis's own approval page (a separate origin this
+// page can't script) where the user approves; chassis signs, pays and
+// verifies, and this widget only polls for the result. It pays any
+// pricing/<itemId> with a Stellar destination, spending the wallet's XLM
+// and delivering exactly the priced USDC. Freighter and MetaMask remain in
+// the same list as the alternative.
 function mountPaymentWidget(container, options) {
   options = options || {};
   const itemId = options.itemId;
@@ -145,6 +155,7 @@ function mountPaymentWidget(container, options) {
   }
 
   let networks = [];
+  let chassisWallet = null;
   function currentNetwork() {
     return networks.find((n) => n.key === networkSelect.value);
   }
@@ -182,6 +193,12 @@ function mountPaymentWidget(container, options) {
 
       const all = await fetchJson(bareUrl('payment/networks'));
       networks = all.networks.filter((n) => Boolean(destinationFor(n)));
+      // Older chassis (or a public, proxied one) has no wallet route at all;
+      // anything but a clear "available" just means no chassis-wallet option.
+      chassisWallet = await fetchJson(absoluteUrl('wallet/available')).catch(() => null);
+      if (chassisWallet && chassisWallet.available && destinations.stellar) {
+        networks.unshift({ key: 'chassis-wallet', chain: 'chassis', label: 'Chassis wallet (Stellar testnet)', tokens: ['USDC'] });
+      }
       if (networks.length === 0) {
         throw new Error(`pricing/${itemId}'s destination has no chain this sidecar supports`);
       }
@@ -193,13 +210,66 @@ function mountPaymentWidget(container, options) {
         networkSelect.appendChild(opt);
       }
       populateTokens();
-      payButton.textContent = `Connect wallet and pay $${amountUsd}`;
+      updateButtonLabel();
       payButton.disabled = false;
     } catch (err) {
       setStatus(`Could not load payment options - ${err.message}`);
     }
   })();
-  networkSelect.addEventListener('change', populateTokens);
+  function updateButtonLabel() {
+    const network = currentNetwork();
+    payButton.textContent = network && network.chain === 'chassis'
+      ? `Pay $${amountUsd}`
+      : `Connect wallet and pay $${amountUsd}`;
+  }
+  networkSelect.addEventListener('change', () => {
+    populateTokens();
+    updateButtonLabel();
+  });
+
+  // Must start synchronously inside the click handler: the popup is opened
+  // before the first await, or Safari's popup blocker refuses it.
+  async function payWithChassisWallet() {
+    const popup = window.open('', 'chassis-wallet', 'popup,width=460,height=700');
+    try {
+      setStatus('Asking your chassis wallet...');
+      const request = await fetchJson(absoluteUrl(`wallet/pay/${encodeURIComponent(itemId)}`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (popup) {
+        popup.location.href = request.approve_url;
+        setStatus('Approve the payment in the chassis wallet window...');
+      } else {
+        statusEl.replaceChildren(
+          'Your browser blocked the wallet window. ',
+          Object.assign(document.createElement('a'), {
+            href: request.approve_url, target: 'chassis-wallet', textContent: 'Open it to approve the payment',
+          })
+        );
+      }
+      // The approval page lives on the wallet's own origin and is isolated
+      // from this page (no opener access either way), so the outcome comes
+      // only from chassis itself. Closing that window without choosing
+      // counts as a rejection; requests expire after 15 minutes regardless.
+      const deadline = Date.now() + 15 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const state = await fetchJson(absoluteUrl(request.status_path));
+        if (state.status === 'processing') setStatus('Paying...');
+        if (state.status === 'paid') return state.receipt;
+        if (state.status === 'rejected') throw new Error('you rejected it in the wallet');
+        if (state.status === 'failed') throw new Error(state.error);
+      }
+      throw new Error('the request expired before it was approved');
+    } catch (err) {
+      if (popup && !popup.closed) {
+        try { popup.close(); } catch (_) {}
+      }
+      throw err;
+    }
+  }
 
   // Loaded from a CDN as real ES modules - see /create-app's own page for
   // why Freighter's package is used directly instead of Stellar Wallets
@@ -338,7 +408,9 @@ function mountPaymentWidget(container, options) {
     payButton.disabled = true;
     try {
       const network = currentNetwork();
-      const receipt = network.chain === 'stellar' ? await payOnStellar(network) : await payOnEvm(network);
+      const receipt = network.chain === 'chassis'
+        ? await payWithChassisWallet()
+        : network.chain === 'stellar' ? await payOnStellar(network) : await payOnEvm(network);
       setStatus('Payment confirmed.');
       onPaid(receipt);
     } catch (err) {
