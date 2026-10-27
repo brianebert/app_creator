@@ -1,1 +1,4 @@
-anthropic
+# Pinned below 2.0: 2.x sends the API key as "Authorization: Bearer"
+# instead of x-api-key, and the Tenki claude-api secret policy only
+# substitutes CLAUDE_KEY into x-api-key (secret_injection_denied otherwise).
+anthropic==1.16.0
